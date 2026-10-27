@@ -1,0 +1,74 @@
+{
+  "id": "sayit",
+  "version": "1.0a",
+  "ele3_version": "1.0a",
+  "license": "GPL-2.0-or-later",
+  "title": "SAY IT (Digitakt machine)",
+  "category": "Sound",
+  "author": "x2k",
+  "description": "SAY IT, a SAM speech machine for the Digitakt mk1: SAM's own reciter and formant synthesiser, ported from s-macke/SAM and proven sample-identical to it, rendering the track's voice itself. Type a phrase on the machine's own naming screen (YES on the SRC page of a track whose sound is SAY IT), then play its tokens from C5 upwards: each key is the next word (WORD) or character (CHAR), a semitone higher than the one below. PIT transposes two octaves each way (+24/-24 semitones), SPD changes speaking speed, and THRT/MOUT shape SAM's voice. The five controls are the machine's own SRC-page knobs, so p-locks, the two system LFOs, Randomize and MIDI CC 16-23 work on them. Every track has its own phrase and its own voice, so SAY IT on two tracks speaks on both at once. A phrase is kept in that track's own sound, in the words the machine does not use as knobs, so the unit saves it with the pattern and the project and it comes back after a power cycle; a Digitakt sound has room for 20 characters, against the Digitone machine's 255. Plays through the track's filter, amp envelope, level and effects. S.A.M. is abandonware (its vendor is gone; see sam/README.md for the provenance). Needs core 3.0 and machine-pages 1.2, on OS 1.54. Machine id 77.",
+  "device": "digitakt-mk1",
+  "os": "1.54",
+  "cflags": [
+    "-DSAYIT_TRACKS=8",
+    "-DSAM_ENGINES=8",
+    "-DSAYIT_EDIT_LEN=20"
+  ],
+  "sources": [
+    "engine.c",
+    "overlay.c",
+    "../../sam/sam_port.c",
+    "../../sam/sam_engine_1.c",
+    "../../sam/sam_engine_2.c",
+    "../../sam/sam_engine_3.c",
+    "../../sam/sam_engine_4.c",
+    "../../sam/sam_engine_5.c",
+    "../../sam/sam_engine_6.c",
+    "../../sam/sam_engine_7.c",
+    "../../sam/sam_multi.c",
+    "../../sam/reciter.c"
+  ],
+  "machines": [
+    {
+      "id": 77,
+      "descriptor": "sayit_machine"
+    }
+  ],
+  "subscribe": [
+    {
+      "event": "ev_render_voices",
+      "fn": "sayit_render",
+      "order": 20
+    },
+    {
+      "event": "ev_tick",
+      "fn": "sayit_tick",
+      "order": 60
+    },
+    {
+      "event": "ev_draw",
+      "fn": "sayit_draw",
+      "order": 60
+    },
+    {
+      "event": "ev_key",
+      "fn": "sayit_key_handler",
+      "order": 60
+    },
+    {
+      "event": "ev_enc",
+      "fn": "sayit_enc_handler",
+      "order": 60
+    }
+  ],
+  "requires": [
+    "core",
+    "machine-pages"
+  ],
+  "resources": {
+    "core": "3.0",
+    "names": [
+      "machine:77"
+    ]
+  }
+}

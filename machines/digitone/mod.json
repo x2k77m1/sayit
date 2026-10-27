@@ -1,0 +1,86 @@
+{
+  "id": "sayit",
+  "version": "1.0a",
+  "ele3_version": "1.0a",
+  "license": "GPL-2.0-or-later",
+  "title": "SAY IT (Digitone machine)",
+  "category": "Sound",
+  "author": "x2k",
+  "description": "SAY IT, a SAM speech machine for the Digitone mk1: SAM's own reciter and formant synthesiser, ported from s-macke/SAM and proven sample-identical to it. Type a phrase on the factory-style naming screen (YES on a SAYIT page), then play its tokens from C upwards: each key is the next word (WORD) or character (CHAR), a semitone higher than the one below. PIT transposes two octaves each way (+24/-24 semitones), SPD changes speaking speed, and THRT/MOUT shape SAM's voice. The knobs are the stock FM parameters', so p-locks and the two LFOs work on them: holding any trig shows that step's locked values (the cell inverts), and an LFO on PIT or SPD bends a word already speaking. Every track has its own phrase and its own voice, so SAY IT on two tracks speaks on both at once. The phrases are saved with the project. Plays through the Digitone's filter/mixer/effects/AMP envelope. S.A.M. is abandonware (its vendor is gone; see sam/README.md for the provenance). Needs core-dn1 4.0 and the machines companion 0.2, on OS 1.44.",
+  "device": "digitone-mk1",
+  "os": "1.44",
+  "cflags": [
+    "-DPATPTR_AT=0x4138f214"
+  ],
+  "sources": [
+    "engine.c",
+    "overlay.c",
+    "../../sam/sam_port.c",
+    "../../sam/sam_engine_1.c",
+    "../../sam/sam_engine_2.c",
+    "../../sam/sam_engine_3.c",
+    "../../sam/sam_multi.c",
+    "../../sam/reciter.c"
+  ],
+  "subscribe": [
+    {
+      "event": "ev_tick",
+      "fn": "sayit_tick",
+      "order": 60
+    },
+    {
+      "event": "ev_draw",
+      "fn": "sayit_draw",
+      "order": 60
+    },
+    {
+      "event": "ev_key",
+      "fn": "sayit_key_handler",
+      "order": 60
+    },
+    {
+      "event": "ev_enc",
+      "fn": "sayit_enc_handler",
+      "order": 60
+    }
+  ],
+  "contribute": [
+    {
+      "to": "dn_machines",
+      "order": 50,
+      "data": "00000000",
+      "relocs": [
+        [
+          0,
+          "abs32",
+          "sym:sayit_machine",
+          0
+        ]
+      ]
+    },
+    {
+      "to": "core_projdata",
+      "order": 60,
+      "data": "00000000",
+      "relocs": [
+        [
+          0,
+          "abs32",
+          "sym:sayit_projdata",
+          0
+        ]
+      ]
+    }
+  ],
+  "resources": {
+    "names": [
+      "dnmachine:77",
+      "projdata:SAYI"
+    ],
+    "core": "4.0"
+  },
+  "requires": [
+    "core",
+    "machines"
+  ]
+}

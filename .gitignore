@@ -1,0 +1,25 @@
+# Build output. The .elemod is attached to a release, never committed, and the
+# .syx contains Elektron's firmware: keep it on your own machine.
+out/
+*.elemod
+*.syx
+*.bin
+*.elf
+*.o
+sections/
+snapshots/
+firmware/
+check*/
+portable/
+
+# The third-party checkouts, fetched by scripts/setup.sh
+3rdparty/
+
+# Python / local tooling
+__pycache__/
+.venv/
+*.log
+
+# macOS
+.DS_Store
+**/.DS_Store
