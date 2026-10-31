@@ -60,6 +60,26 @@ static int32_t ph_is(const uint8_t *ph, int32_t n, const uint8_t *want, int32_t 
     return 1;
 }
 
+/* One engine's whole 22.05 kHz stream, so two note starts can be compared
+ * sample by sample. Returns the length (sam_voice_next ends at -1). */
+static int32_t render_engine(int32_t engine, uint8_t *out, int32_t max) {
+    int32_t n = 0, v;
+    while ((v = sam_voice_next_tr(engine)) >= 0) {
+        if (n < max) out[n] = (uint8_t)v;
+        n++;
+    }
+    return n;
+}
+
+/* A track's voice, rendered to 48 kHz Q15, so a plan start and a text start can
+ * be compared all the way out. */
+static int32_t render_voice(struct sayit_voice *s, int32_t *out, int32_t max) {
+    int32_t n = 0;
+    while (n < max && s->active)
+        out[n++] = sayit_frame(s);
+    return n;
+}
+
 int main(void) {
     uint16_t offs[32];
     uint8_t lens[32];
@@ -196,6 +216,242 @@ int main(void) {
         CHECK(ph[2] == 'T' && ph[3] == 'U' && ph[4] == 'W', "reciter-digits");
         CHECK(sam_voice_begin("   ", 3, &st) == 0, "sam-silence-for-spaces");
         CHECK(sam_voice_begin("", 0, &st) == 0, "sam-empty");
+    }
+
+    /* ---- the plan: the recitation ahead of the trigger ---- */
+    /* The whole point of the split is that a note started from a plan is the
+     * note started from the text: same stream, sample for sample. Anything
+     * else would be a different sound at a trigger than the one the UI task
+     * prepared. */
+    {
+        struct sam_settings st;
+        static const char *const words[] = {
+            "say", "it", "hello", "2024", "computer", "a", "z", "the",
+            "strengths", "q"
+        };
+        static uint8_t a[65536], b[65536], plan[4096];
+        int32_t w, na, nb, np;
+
+        sayit_resolve(64, 0, 64, 64, &st);
+        for (w = 0; w < (int32_t)(sizeof(words) / sizeof(words[0])); w++) {
+            const char *txt = words[w];
+            int32_t len = (int32_t)strlen(txt);
+            np = sam_plan_build(txt, len, plan, (int32_t)sizeof(plan));
+            if (w == 0)
+                CHECK(np > 0, "plan-say-builds");
+            CHECK(sam_voice_begin_tr(0, txt, len, &st) == 1, "plan-text-speaks");
+            na = render_engine(0, a, (int32_t)sizeof(a));
+            CHECK(np > 0 && sam_voice_begin_plan_tr(0, plan, np, &st) == 1,
+                  "plan-starts");
+            nb = render_engine(0, b, (int32_t)sizeof(b));
+            CHECK(na == nb && na > 1000 && memcmp(a, b, (size_t)na) == 0,
+                  "plan-is-the-same-stream");
+        }
+        /* A text that says nothing (spaces) still has a stream - SAM's own
+         * phonemes for it - and both paths must call it silent and render the
+         * same silence. An empty plan is silent too. */
+        np = sam_plan_build("   ", 3, plan, (int32_t)sizeof(plan));
+        CHECK(np >= 0, "plan-spaces-builds");
+        CHECK(sam_voice_begin_tr(0, "   ", 3, &st) == 0, "plan-spaces-text-silent");
+        na = render_engine(0, a, (int32_t)sizeof(a));
+        CHECK(sam_voice_begin_plan_tr(0, plan, np, &st) == 0,
+              "plan-spaces-plan-silent");
+        nb = render_engine(0, b, (int32_t)sizeof(b));
+        CHECK(na == nb && memcmp(a, b, (size_t)na) == 0, "plan-spaces-same-silence");
+        CHECK(sam_voice_begin_plan_tr(0, plan, 0, &st) == 0, "plan-empty-is-silent");
+        CHECK(sam_plan_build("", 0, plan, (int32_t)sizeof(plan)) == 0,
+              "plan-no-text");
+        CHECK(sam_plan_build("hello", 5, plan, 6) == -1, "plan-refuses-no-room");
+    }
+
+    /* A whole phrase's plan, at the machine's level: the tokens are built a
+     * step at a time, and the note each key names sounds exactly what the text
+     * path would have sounded. */
+    {
+        static struct sayit_plan p;
+        struct sayit_voice va, vb;
+        static int32_t oa[6000], ob[6000];
+        uint16_t poffs[32];
+        uint8_t plens[32];
+        char pexp[24];
+        struct sayit_start start;
+        static const char *const toks[2] = { "say", "it" };
+        const char *phrase = "say it";
+        int32_t steps = 0, i, na, nb, guard;
+        const uint8_t *stream;
+        uint8_t nph;
+
+        sayit_plan_drop(&p);
+        CHECK(!sayit_plan_ready(&p, SAYIT_WORD), "plan-not-ready-before");
+        while (sayit_plan_step(&p, phrase, SAYIT_WORD))
+            steps++;
+        CHECK(steps == 2, "plan-one-step-a-token");
+        CHECK(sayit_plan_ready(&p, SAYIT_WORD), "plan-ready-after");
+        CHECK(!sayit_plan_ready(&p, SAYIT_CHAR), "plan-mode-keyed");
+        CHECK(p.count == 2, "plan-token-count");
+        /* Each token's stream is the one the render would have recited: the
+         * token started from the plan sounds exactly like the one recited
+         * here, all the way out to 48 kHz. */
+        for (i = 0; i < 2; i++) {
+            CHECK(sayit_plan_stream(&p, SAYIT_WORD, i, &stream, &nph) && nph > 0,
+                  "plan-token-has-stream");
+            CHECK(sayit_start_resolve(&start, &p, phrase, SAYIT_WORD,
+                                      SAYIT_BASE + i, poffs, plens, pexp,
+                                      (int32_t)sizeof(pexp)) == 1,
+                  "plan-resolves-token");
+            CHECK(start.plan != 0 && start.idx == i && start.count == 2,
+                  "plan-start-uses-plan");
+            sayit_voice_init(&va);
+            CHECK(sayit_voice_start_plan(&va, 0, start.plan, start.nph, 64, 0,
+                                         64, 64, 1) == 1,
+                  "plan-voice-starts");
+            na = render_voice(&va, oa, (int32_t)(sizeof(oa) / sizeof(oa[0])));
+            sayit_voice_init(&vb);
+            CHECK(sayit_voice_start(&vb, 1, toks[i], (int32_t)strlen(toks[i]),
+                                    64, 0, 64, 64, 1) == 1,
+                  "plan-text-voice-starts");
+            nb = render_voice(&vb, ob, (int32_t)(sizeof(ob) / sizeof(ob[0])));
+            CHECK(na == nb && na > 1000 && memcmp(oa, ob, (size_t)na * 4) == 0,
+                  "plan-voice-is-same-audio");
+        }
+        /* A note past the phrase, and one below C5, say nothing - through the
+         * plan exactly as through the text. */
+        CHECK(sayit_start_resolve(&start, &p, phrase, SAYIT_WORD, SAYIT_BASE + 2,
+                                  poffs, plens, pexp, (int32_t)sizeof(pexp)) == 0,
+              "plan-note-past-phrase-silent");
+        CHECK(sayit_start_resolve(&start, &p, phrase, SAYIT_WORD, SAYIT_BASE - 1,
+                                  poffs, plens, pexp, (int32_t)sizeof(pexp)) == 0,
+              "plan-note-below-root-silent");
+        /* A mode the plan was not built for is rebuilt rather than answering
+         * wrongly, and one step a tick is what gets it there. Ready means the
+         * token table is for this mode; the streams arrive token by token, so a
+         * token the walk has not reached answers nothing yet. */
+        CHECK(sayit_plan_step(&p, phrase, SAYIT_CHAR) == 1, "plan-rebuilds-mode");
+        CHECK(sayit_plan_ready(&p, SAYIT_CHAR) && !p.done,
+              "plan-rebuild-walk-not-done");
+        CHECK(sayit_plan_stream(&p, SAYIT_CHAR, 0, &stream, &nph),
+              "plan-built-token-has-stream");
+        CHECK(!sayit_plan_stream(&p, SAYIT_CHAR, 4, &stream, &nph),
+              "plan-unbuilt-token-no-stream");
+        for (guard = 0; guard < 16 && sayit_plan_step(&p, phrase, SAYIT_CHAR); guard++)
+            ;
+        CHECK(sayit_plan_ready(&p, SAYIT_CHAR), "plan-char-ready");
+        CHECK(p.count == 5, "plan-char-token-count");
+        CHECK(!sayit_plan_ready(&p, SAYIT_WORD), "plan-other-mode-still-gone");
+        sayit_plan_drop(&p);
+        CHECK(!sayit_plan_ready(&p, SAYIT_CHAR), "plan-drop-clears");
+        /* One token built out of its turn, which is what a note the render is
+         * waiting on asks for: the token is there before the walk reaches it. */
+        while (sayit_plan_step(&p, phrase, SAYIT_WORD))
+            ;
+        sayit_plan_drop(&p);
+        CHECK(sayit_plan_step(&p, phrase, SAYIT_WORD) == 1, "plan-want-setup");
+        CHECK(!sayit_plan_stream(&p, SAYIT_WORD, 1, &stream, &nph),
+              "plan-want-not-built-yet");
+        CHECK(sayit_plan_want_token(&p, phrase, SAYIT_WORD, 1) == 1,
+              "plan-want-builds-that-token");
+        CHECK(sayit_plan_stream(&p, SAYIT_WORD, 1, &stream, &nph) && nph > 0,
+              "plan-want-has-stream");
+        /* A token whose stream does not fit the pool is left without one: the
+         * render waits for it and then gives up (a dropped token, never a stall
+         * in the audio block). */
+        p.used = (uint16_t)(sizeof(p.pool) - 3);
+        p.off[0] = SAYIT_PLAN_NONE;
+        p.off[1] = SAYIT_PLAN_NONE;
+        p.done = 0;
+        p.next = 0;
+        CHECK(sayit_plan_step(&p, phrase, SAYIT_WORD) == 1, "plan-step-full-pool");
+        CHECK(p.off[0] == SAYIT_PLAN_NONE, "plan-full-pool-no-stream");
+        CHECK(!sayit_plan_stream(&p, SAYIT_WORD, 0, &stream, &nph),
+              "plan-full-pool-falls-back");
+        CHECK(sayit_start_resolve(&start, &p, phrase, SAYIT_WORD, SAYIT_BASE,
+                                  poffs, plens, pexp, (int32_t)sizeof(pexp)) == 1
+              && start.plan == 0 && start.text != 0 && start.idx == 0,
+              "plan-falls-back-to-text");
+    }
+
+    /* ---- how much one call may render (SAM_LOOKAHEAD) ---- */
+    /* The port's writer makes a source sample on demand, and a call that has to
+     * make one may run at most SAM_LOOKAHEAD bytes ahead of the reader. That is
+     * what keeps a block bounded: if the lookahead stopped covering a block, a
+     * block would ask for a byte the writer had not made and the writer would
+     * fill its ring in that one call, which is SAM's own several thousand
+     * cycles in one audio block. The reader takes SAYIT_STEP of a source sample
+     * per output sample, 32 samples a block, and the writer releases bytes 10
+     * behind its head (sam_wr = base + 5, sam_valid = base - 5), so the two
+     * numbers have to hold together. */
+    {
+        int32_t per_block = (32 * SAYIT_STEP + 65535) / 65536;
+        /* At least a block of margin between the reader and the writer, and no
+         * more than two blocks: the lookahead is the size of one block's burst
+         * of synthesis, so a larger one is a spike for the sake of slack. */
+        CHECK(SAM_LOOKAHEAD - 10 >= per_block, "lookahead-covers-a-block");
+        CHECK(SAM_LOOKAHEAD <= 2 * per_block + 10, "lookahead-is-not-a-burst");
+        CHECK(per_block == 15, "block-reads-fifteen-bytes");
+        CHECK(SAM_LOOKAHEAD < 240, "lookahead-leaves-the-ring-room");
+    }
+
+    /* ---- a chunk's tables, made a slice a block ---- */
+    /* The machines compile the port with SAM_SETUP_SLICED: while a chunk's
+     * tables are being made sam_voice_next() is silence, and the block hook
+     * (sam_voice_setup) makes them a few units a block. The audio must be the
+     * same stream the one-shot path makes, after the silence its setup took,
+     * and the tables must be ready in a handful of blocks rather than all in
+     * the block that starts the note. tools/sam_sliced.c is that build. */
+    {
+        static int32_t ref[20000], sli[20000];
+        struct sam_settings st = { 72, 64, 128, 128, 0, 32768 };
+        int32_t n = 0, m = 0, v, i, a = 0, b = 0, blocks = 0, setup_blocks = 0;
+        /* the sliced copy (tools/sam_sliced.c), under its own names */
+        int sam_voice_begin_s(const char *, int, const struct sam_settings *);
+        int sam_voice_next_s(void);
+        int sam_voice_ready_s(void);
+        void sam_voice_setup_s(void);
+
+        sam_voice_begin("say it", 6, &st);
+        while ((v = sam_voice_next()) >= 0 && m < 20000)
+            ref[m++] = v;
+
+        sam_voice_begin_s("say it", 6, &st);
+        while (blocks < 400 && n < 20000) {
+            /* The hook is the machine's per-block tick: it makes a slice while
+             * the tables are being made and, in the block that finishes them,
+             * holds the ring's writer back. A machine calls it every block, so
+             * this does too. */
+            if (!sam_voice_ready_s())
+                setup_blocks++;
+            sam_voice_setup_s();
+            for (i = 0; i < 32; i++) {
+                v = sam_voice_next_s();
+                if (v < 0)
+                    break;
+                if (n < 20000)
+                    sli[n++] = v;
+            }
+            if (v < 0)
+                break;
+            blocks++;
+        }
+        CHECK(m > 2000, "slice-reference-stream");
+        CHECK(setup_blocks >= 1 && setup_blocks <= 24,
+              "slice-setup-is-a-few-blocks");
+        /* Both streams start with silence - the ring's three bytes, and in the
+         * sliced one the blocks its setup took - so compare what follows it. */
+        for (a = 0; a < m && ref[a] == 128; a++)
+            ;
+        for (b = 0; b < n && sli[b] == 128; b++)
+            ;
+        CHECK(b > a + 32, "slice-waits-for-its-tables");
+        /* Every block the setup took is silent, the one that finishes the
+         * tables included: that block takes no refill, so it carries the slice
+         * or the refill and never both, and the writer's first fill is the next
+         * block. Without the hold the last of these blocks would already be
+         * audio, which is the peak this keeps out of one block. */
+        CHECK(b >= 32 * setup_blocks, "slice-and-refill-in-separate-blocks");
+        CHECK(n - b == m - a && n > b &&
+              memcmp(sli + b, ref + a, (size_t)(m - a) * 4) == 0,
+              "slice-same-stream-after-silence");
+        CHECK(sam_voice_ready_s(), "slice-setup-finishes");
     }
 
     /* ---- the SAM voice and its four controls ---- */
@@ -652,8 +908,10 @@ def main():
            os.path.join(ROOT, "sam", "sam_engine_1.c"),
            os.path.join(ROOT, "sam", "sam_engine_2.c"),
            os.path.join(ROOT, "sam", "sam_engine_3.c"),
+           os.path.join(ROOT, "sam", "sam_engine_plan.c"),
            os.path.join(ROOT, "sam", "sam_multi.c"),
-           os.path.join(ROOT, "sam", "reciter.c"), "-o", EXE, "-lm"]
+           os.path.join(ROOT, "sam", "reciter.c"),
+           os.path.join(ROOT, "tools", "sam_sliced.c"), "-o", EXE, "-lm"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print("COMPILE FAILED:\n" + r.stderr)
@@ -741,6 +999,22 @@ def main():
     for kw in ["sam_voice_live", "sam_voice_live_tr"]:
         if kw not in api:
             print("FAIL sam_api.h has no %s" % kw); fails += 1
+    # The writer's bound lives in one predicate, and every place that suspends
+    # asks it: the glottal loop and both of RenderSample's bit loops. A suspend
+    # that tested the ring's own end instead would let one call fill the ring,
+    # which is the DSP spike this bound exists to prevent (the C tests above
+    # hold the arithmetic).
+    with open(os.path.join(ROOT, "sam", "sam_port.c")) as f:
+        port = f.read()
+    if "SAM_LOOKAHEAD" not in api:
+        print("FAIL sam_api.h does not name the writer's lookahead"); fails += 1
+    if "SAM_LOOKAHEAD" not in port:
+        print("FAIL the port does not use the lookahead"); fails += 1
+    if port.count("if (sam_ring_full())") != 3:
+        print("FAIL the port suspends in %d places, not 3"
+              % port.count("if (sam_ring_full())")); fails += 1
+    if port.count("sam_ring_space() < 16") != 1:
+        print("FAIL a suspend tests the ring's end, not the lookahead"); fails += 1
     # The cell a function is drawn in must sit on the encoder that edits it.
     # The Digitone's encoders are two rows of four, A-D above E-H, and the
     # overlay draws every SAYIT cell in the lower band; so every mapped knob
@@ -861,6 +1135,43 @@ def main():
     toast = toast[1].split("return;", 1)[0] if len(toast) > 1 else ""
     if "fw_fillrect" not in toast or "fw_framerect" not in toast:
         print("FAIL digitakt save confirmation is not drawn in a box"); fails += 1
+
+    # ---- the plan (sayit.h, "the plan") ---------------------------------
+    # The recitation is SAM's reciter and parsers, thousands of bytes of tables
+    # and buffers per token. It runs on the UI task now, and a note start copies
+    # the stream it made: reciting in the audio callback spends a block's whole
+    # budget on one trigger, which the unit shows as a DSP spike. So every piece
+    # has to be in place - the planning engine in both builds, one token a tick
+    # from each machine's tick, and the render starting from the plan.
+    for kw in ["sam_plan_build", "sam_voice_begin_plan_tr", "struct sayit_plan",
+               "sayit_plan_drop", "sayit_plan_step", "sayit_start_resolve",
+               "sayit_voice_start_plan"]:
+        if kw not in core:
+            print("FAIL sayit.h has no %s" % kw); fails += 1
+    for kw in ["sam_plan_build", "sam_voice_begin_plan_tr"]:
+        if kw not in api:
+            print("FAIL sam_api.h does not declare %s" % kw); fails += 1
+    if not os.path.exists(os.path.join(ROOT, "sam", "sam_engine_plan.c")):
+        print("FAIL the planning engine has no source"); fails += 1
+    for name, man, engine, ovlay in (("digitone", mod, eng, ovl),
+                                     ("digitakt", dmod, deng, dovl)):
+        if '"../../sam/sam_engine_plan.c"' not in man:
+            print("FAIL %s mod.json does not build the planning engine" % name)
+            fails += 1
+        if "-DSAYIT_PLAN_BYTES=" not in man:
+            print("FAIL %s mod.json does not size the plan" % name); fails += 1
+        if "struct sayit_plan sayit_pl[" not in engine:
+            print("FAIL %s engine keeps no plans" % name); fails += 1
+        if "sayit_plan_tick" not in engine or "sayit_plan_tick" not in ovlay:
+            print("FAIL %s does not build the plan on its tick" % name); fails += 1
+        if "sayit_start_resolve" not in engine:
+            print("FAIL %s render does not start notes from the plan" % name)
+            fails += 1
+        if "sayit_plan_drop" not in engine:
+            print("FAIL %s does not drop a plan its phrase moved under" % name)
+            fails += 1
+    if "sam_voice_begin_tr" not in core:
+        print("FAIL the fallback text start left sayit.h"); fails += 1
     if fails:
         print("HYGIENE FAILED")
         return 1

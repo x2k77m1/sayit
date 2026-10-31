@@ -17,6 +17,18 @@
  *   - sam_voice_live() moves the speed and the pitch factor of a phrase that
  *     is already speaking, which SAM never needed (it rendered a whole buffer
  *     at once): the machine's knobs and LFOs are read every block.
+ *   - A note start is split at the phoneme stream: sam_text_begin() (reciter and
+ *     parsers, the half that costs the bus) and sam_render_begin() (the chunk
+ *     and its frames). A machine can have the first half run ahead of the
+ *     trigger on the UI task (sam_plan_build / sam_voice_begin_plan) instead of
+ *     inside an audio block, where it does not fit.
+ *   - The writer stops SAM_LOOKAHEAD bytes ahead of the reader, not at the end
+ *     of the ring, so one call makes an eighth of the samples it used to and
+ *     no audio block carries a whole ring of synthesis (see SAM_LOOKAHEAD).
+ *   - A chunk's tables (its frames, their blend tables, the pitch contour and
+ *     the amplitude rescale) are made a slice at a time (render_setup starts a
+ *     chunk; render_setup_slice advances it), so the block that starts a note
+ *     does not carry the whole chunk.
  *   - The first three output bytes, left uninitialised by the original, are
  *     silence instead of a click.
  *   - SAM's globals are file-static, so the port can share a module.
@@ -138,10 +150,43 @@ void SetMouthThroat(unsigned char mouth, unsigned char throat);
 // 174=amplitude3
 
 
+static void sam_set_mouth_throat(unsigned char mouth, unsigned char throat)
+{
+    /* The formant tables the mouth and throat shape are rewritten from 32
+     * table entries through trans() every time a chunk starts, and a phrase
+     * played at one THRT/MOUT setting only needs them once: they depend on
+     * those two bytes and nothing else. Keeping the last pair turns a note
+     * start into a compare when the controls have not moved, which is what a
+     * sequencer repeating a word does. */
+    static unsigned char last_mouth, last_throat;
+    static int have;
+    if (have && last_mouth == mouth && last_throat == throat)
+        return;
+    /* Cleared first: the rebuild can be interrupted by the audio block, and a
+     * note start that arrives mid-rebuild must make the tables itself rather
+     * than read half of one pair and half of another (sam_voice_prime). */
+    have = 0;
+    SetMouthThroat(mouth, throat);
+    last_mouth = mouth;
+    last_throat = throat;
+    have = 1;
+}
+
+/* The same tables, made ahead of the note: a machine's UI task calls this with
+ * the settings its knobs hold now, so the note that follows finds the pair in
+ * place and the block that starts it carries only the chunk's frames. The
+ * tables depend on those two bytes alone, so nothing here is wasted when the
+ * controls have not moved - it is the compare above and a return. */
+void sam_voice_prime(const struct sam_settings *s)
+{
+    if (s)
+        sam_set_mouth_throat(s->mouth, s->throat);
+}
+
 static void Init()
 {
     int i;
-    SetMouthThroat( mouth, throat);
+    sam_set_mouth_throat( mouth, throat);
 
 
     /*
@@ -1527,12 +1572,30 @@ static int timetable[5][5] =
  * bufferpos/50 at 22.05 kHz: five samples per glottal step, advancing three or
  * four, so the writes overlap on purpose. The ring keeps that exactly and only
  * bounds how far ahead of the reader the renderer may run. sam_valid releases
- * a byte once no later write can still reach it. */
+ * a byte once no later write can still reach it.
+ *
+ * How far ahead is the whole of a block's cost. The reader asks for a byte and,
+ * when it has caught up with the writer, has the writer make more; a writer that
+ * runs to the end of the ring makes SAM's own several thousand cycles in that
+ * one call, which lands in a single audio block - the unit shows it as a DSP
+ * spike, and at a word trigger it clips whatever else is playing. SAM_LOOKAHEAD
+ * is what a call may run ahead instead, SAM_LOOKAHEAD (sam_api.h): at 22.05 kHz
+ * and 48 kHz out the reader takes about 15 bytes a block, so a lookahead of 32
+ * covers two blocks and each refill is eight glottal steps instead of seventy.
+ * sam_ring_full() is the one place that says so; the writer suspends there and
+ * the caller resumes it (render_pump and RenderSample keep all their state). */
 #define SAM_RING 256
 static unsigned char sam_ring[SAM_RING];
 static uint32_t sam_wr, sam_rd, sam_valid;
 static uint32_t sam_bufpos;
 static unsigned char oldtimetableindex;
+
+static int sam_ring_full(void)
+{
+    if ((int)(sam_wr - sam_rd) >= SAM_LOOKAHEAD)
+        return 1;
+    return sam_ring_space() < 16;   /* never with the lookahead above: belt and braces */
+}
 
 static void Output8BitAry(int index, unsigned char ary[5])
 {
@@ -1709,7 +1772,7 @@ pos48274:
     // mem47*256 = offset to start of samples
     A = sampleTable[mem47*256+Y];
 pos48280:
-    if (sam_ring_space() < 16) { rs_resume = 1; return 1; }
+    if (sam_ring_full()) { rs_resume = 1; return 1; }
 
     // left shift to get the high bit
     tempA = A;
@@ -1775,7 +1838,7 @@ pos48315:
         // loop 8 times
         //pos48327:
 pos48327:
-        if (sam_ring_space() < 16) { rs_resume = 2; return 1; }
+        if (sam_ring_full()) { rs_resume = 2; return 1; }
         do
         {
             //48327: ASL A
@@ -1851,422 +1914,309 @@ static unsigned char mem40;
 static unsigned char speedcounter; //mem45
 static unsigned char mem48;
 
+/* ---- a chunk's tables, made in slices ------------------------------------ */
+/* SAM made a chunk's whole frame list (up to 600 frames), blended every
+ * phoneme boundary across seven tables, and then walked the frame slots twice,
+ * all before the first sample and all inside the audio block of the note
+ * start. On the cycle model that is ~12 400 cycles - six refills' worth - in
+ * one block: the peak the unit shows as a CPU spike and another track's voice
+ * hears as a click. It is the same work, resumed. render_setup() starts a
+ * chunk; render_setup_slice() advances it by a few units; the machine calls
+ * that once a block (sam_voice_setup_tr), so a block carries a slice of the
+ * chunk instead of the chunk. Nothing reads the frame tables until the pulse
+ * loop starts, and that only happens once the phase below is the last, so
+ * sam_voice_next() says silence meanwhile: a word can start a millisecond or
+ * two late, but no block carries the chunk.
+ *
+ * A caller that keeps asking for samples and never calls the block hook - the
+ * host tests, the parity harness, anything that just reads the stream - still
+ * gets there: sam_voice_next() advances a unit per call, so those runs make
+ * exactly the samples they made before. */
+
+#define SAM_SETUP_UNITS 6
+
+static int sam_setup;        /* 1 while a chunk's tables are being made */
+static int sam_setup_phase;  /* 0 frames, 1 blends, 2 contour, 3 rescale, 4 pulse */
+static int sam_setup_pos;    /* the contour's and the rescale's position */
+static int sam_frames;       /* frame slots this chunk wrote */
+static int sam_blend_open;   /* a boundary's seven tables are being walked */
+/* 1 in the block whose slice finished a chunk's tables: the ring's first
+ * refill then waits for the next block, so a block carries the slice or the
+ * refill, never both. sam_voice_setup() sets it and clears it again, which is
+ * why a machine calls that hook every block and not only while the tables are
+ * being made. */
+static int sam_hold;
+/* Who advances the setup. A machine calls sam_voice_setup_tr() once a block,
+ * so the samples it asks for meanwhile are silence (SAM_SETUP_SLICED, its
+ * mod.json). Everything else - the host tests, the parity harness, any plain
+ * reader - gets the chunk made inside the call that first needs a sample, as
+ * before, so those streams are byte for byte what they always were. */
+#ifdef SAM_SETUP_SLICED
+static int sam_sliced = 1;
+#else
+static int sam_sliced;
+#endif
+
+/* Begin a chunk: everything the tables are built from is in place (the chunk's
+ * phonemes are in phonemeIndexOutput), and nothing is made yet. */
 static void render_setup(void)
 {
-    int i;
     phase1 = phase2 = phase3 = 0;
     mem66 = mem38 = mem40 = speedcounter = mem48 = 0;
-    if (phonemeIndexOutput[0] == 255) return; //exit if no data
-
+    sam_setup = 0;
+    sam_frames = 0;
+    sam_setup_pos = 0;
+    sam_blend_open = 0;
+    sam_hold = 0;
+    if (phonemeIndexOutput[0] == 255)
+        return;                          /* nothing to say */
     A = 0;
     X = 0;
     mem44 = 0;
+    sam_setup_phase = 0;
+    sam_setup = 1;
+}
 
-
-// CREATE FRAMES
-//
-// The length parameter in the list corresponds to the number of frames
-// to expand the phoneme to. Each frame represents 10 milliseconds of time.
-// So a phoneme with a length of 7 = 7 frames = 70 milliseconds duration.
-//
-// The parameters are copied from the phoneme to the frame verbatim.
-
-
-// pos47587:
-do
+/* CREATE FRAMES: one phoneme of the chunk per unit. A phoneme is a handful of
+ * frames, each seven table reads and seven writes. */
+static int render_frames_step(void)
 {
-    // get the index
     Y = mem44;
-    // get the phoneme at the index
     A = phonemeIndexOutput[mem44];
     mem56 = A;
-
-    // if terminal phoneme, exit the loop
-    if (A == 255) break;
-
-    // period phoneme *.
-    if (A == 1)
-    {
-       // add rising inflection
-        A = 1;
+    if (A == 255) {                      /* end of the chunk */
+        sam_frames = X;
+        return 0;
+    }
+    /* period phoneme *.: rising inflection */
+    if (A == 1) {
         mem48 = 1;
-        //goto pos48376;
         AddInflection(mem48, phase1);
     }
-    /*
-    if (A == 2) goto pos48372;
-    */
-
-    // question mark phoneme?
-    if (A == 2)
-    {
-        // create falling inflection
+    /* question mark phoneme?: falling inflection */
+    if (A == 2) {
         mem48 = 255;
         AddInflection(mem48, phase1);
     }
-    //  pos47615:
-
-    // get the stress amount (more stress = higher pitch)
+    /* get the stress amount (more stress = higher pitch) */
     phase1 = tab47492[stressOutput[Y] + 1];
-
-    // get number of frames to write
+    /* get number of frames to write */
     phase2 = phonemeLengthOutput[Y];
     Y = mem56;
-
-    // copy from the source to the frames list
-    do
-    {
-        frequency1[X] = freq1data[Y];     // F1 frequency
-        frequency2[X] = freq2data[Y];     // F2 frequency
-        frequency3[X] = freq3data[Y];     // F3 frequency
-        amplitude1[X] = ampl1data[Y];     // F1 amplitude
-        amplitude2[X] = ampl2data[Y];     // F2 amplitude
-        amplitude3[X] = ampl3data[Y];     // F3 amplitude
-        sampledConsonantFlag[X] = sampledConsonantFlags[Y];        // phoneme data for sampled consonants
-        pitches[X] = pitch + phase1;      // pitch
+    /* copy from the source to the frames list */
+    do {
+        frequency1[X] = freq1data[Y];     /* F1 frequency */
+        frequency2[X] = freq2data[Y];     /* F2 frequency */
+        frequency3[X] = freq3data[Y];     /* F3 frequency */
+        amplitude1[X] = ampl1data[Y];     /* F1 amplitude */
+        amplitude2[X] = ampl2data[Y];     /* F2 amplitude */
+        amplitude3[X] = ampl3data[Y];     /* F3 amplitude */
+        sampledConsonantFlag[X] = sampledConsonantFlags[Y];  /* sampled consonants */
+        pitches[X] = pitch + phase1;      /* pitch */
         X++;
         phase2--;
-    } while(phase2 != 0);
+    } while (phase2 != 0);
     mem44++;
-} while(mem44 != 0);
-// -------------------
-//pos47694:
+    return 1;
+}
 
-// CREATE TRANSITIONS
-//
-// Linear transitions are now created to smoothly connect the
-// end of one sustained portion of a phoneme to the following
-// phoneme.
-//
-// To do this, three tables are used:
-//
-//  Table         Purpose
-//  =========     ==================================================
-//  blendRank     Determines which phoneme's blend values are used.
-//
-//  blendOut      The number of frames at the end of the phoneme that
-//                will be used to transition to the following phoneme.
-//
-//  blendIn       The number of frames of the following phoneme that
-//                will be used to transition into that phoneme.
-//
-// In creating a transition between two phonemes, the phoneme
-// with the HIGHEST rank is used. Phonemes are ranked on how much
-// their identity is based on their transitions. For example,
-// vowels are and diphthongs are identified by their sustained portion,
-// rather than the transitions, so they are given low values. In contrast,
-// stop consonants (P, B, T, K) and glides (Y, L) are almost entirely
-// defined by their transitions, and are given high rank values.
-//
-// Here are the rankings used by SAM:
-//
-//     Rank    Type                         Phonemes
-//     2       All vowels                   IY, IH, etc.
-//     5       Diphthong endings            YX, WX, ER
-//     8       Terminal liquid consonants   LX, WX, YX, N, NX
-//     9       Liquid consonants            L, RX, W
-//     10      Glide                        R, OH
-//     11      Glide                        WH
-//     18      Voiceless fricatives         S, SH, F, TH
-//     20      Voiced fricatives            Z, ZH, V, DH
-//     23      Plosives, stop consonants    P, T, K, KX, DX, CH
-//     26      Stop consonants              J, GX, B, D, G
-//     27-29   Stop consonants (internal)   **
-//     30      Unvoiced consonants          /H, /X and Q*
-//     160     Nasal                        M
-//
-// To determine how many frames to use, the two phonemes are
-// compared using the blendRank[] table. The phoneme with the
-// higher rank is selected. In case of a tie, a blend of each is used:
-//
-//      if blendRank[phoneme1] ==  blendRank[phomneme2]
-//          // use lengths from each phoneme
-//          outBlendFrames = outBlend[phoneme1]
-//          inBlendFrames = outBlend[phoneme2]
-//      else if blendRank[phoneme1] > blendRank[phoneme2]
-//          // use lengths from first phoneme
-//          outBlendFrames = outBlendLength[phoneme1]
-//          inBlendFrames = inBlendLength[phoneme1]
-//      else
-//          // use lengths from the second phoneme
-//          // note that in and out are SWAPPED!
-//          outBlendFrames = inBlendLength[phoneme2]
-//          inBlendFrames = outBlendLength[phoneme2]
-//
-// Blend lengths can't be less than zero.
-//
-// Transitions are assumed to be symetrical, so if the transition
-// values for the second phoneme are used, the inBlendLength and
-// outBlendLength values are SWAPPED.
-//
-// For most of the parameters, SAM interpolates over the range of the last
-// outBlendFrames-1 and the first inBlendFrames.
-//
-// The exception to this is the Pitch[] parameter, which is interpolates the
-// pitch from the CENTER of the current phoneme to the CENTER of the next
-// phoneme.
-//
-// Here are two examples. First, For example, consider the word "SUN" (S AH N)
-//
-//    Phoneme   Duration    BlendWeight    OutBlendFrames    InBlendFrames
-//    S         2           18             1                 3
-//    AH        8           2              4                 4
-//    N         7           8              1                 2
-//
-// The formant transitions for the output frames are calculated as follows:
-//
-//     flags ampl1 freq1 ampl2 freq2 ampl3 freq3 pitch
-//    ------------------------------------------------
-// S
-//    241     0     6     0    73     0    99    61   Use S (weight 18) for transition instead of AH (weight 2)
-//    241     0     6     0    73     0    99    61   <-- (OutBlendFrames-1) = (1-1) = 0 frames
-// AH
-//      0     2    10     2    66     0    96    59 * <-- InBlendFrames = 3 frames
-//      0     4    14     3    59     0    93    57 *
-//      0     8    18     5    52     0    90    55 *
-//      0    15    22     9    44     1    87    53
-//      0    15    22     9    44     1    87    53
-//      0    15    22     9    44     1    87    53   Use N (weight 8) for transition instead of AH (weight 2).
-//      0    15    22     9    44     1    87    53   Since N is second phoneme, reverse the IN and OUT values.
-//      0    11    17     8    47     1    98    56 * <-- (InBlendFrames-1) = (2-1) = 1 frames
-// N
-//      0     8    12     6    50     1   109    58 * <-- OutBlendFrames = 1
-//      0     5     6     5    54     0   121    61
-//      0     5     6     5    54     0   121    61
-//      0     5     6     5    54     0   121    61
-//      0     5     6     5    54     0   121    61
-//      0     5     6     5    54     0   121    61
-//      0     5     6     5    54     0   121    61
-//
-// Now, consider the reverse "NUS" (N AH S):
-//
-//     flags ampl1 freq1 ampl2 freq2 ampl3 freq3 pitch
-//    ------------------------------------------------
-// N
-//     0     5     6     5    54     0   121    61
-//     0     5     6     5    54     0   121    61
-//     0     5     6     5    54     0   121    61
-//     0     5     6     5    54     0   121    61
-//     0     5     6     5    54     0   121    61
-//     0     5     6     5    54     0   121    61   Use N (weight 8) for transition instead of AH (weight 2)
-//     0     5     6     5    54     0   121    61   <-- (OutBlendFrames-1) = (1-1) = 0 frames
-// AH
-//     0     8    11     6    51     0   110    59 * <-- InBlendFrames = 2
-//     0    11    16     8    48     0    99    56 *
-//     0    15    22     9    44     1    87    53   Use S (weight 18) for transition instead of AH (weight 2)
-//     0    15    22     9    44     1    87    53   Since S is second phoneme, reverse the IN and OUT values.
-//     0     9    18     5    51     1    90    55 * <-- (InBlendFrames-1) = (3-1) = 2
-//     0     4    14     3    58     1    93    57 *
-// S
-//   241     2    10     2    65     1    96    59 * <-- OutBlendFrames = 1
-//   241     0     6     0    73     0    99    61
-
-    A = 0;
-    mem44 = 0;
-    mem49 = 0; // mem49 starts at as 0
-    X = 0;
-    while(1) //while No. 1
-    {
-
-        // get the current and following phoneme
+/* CREATE TRANSITIONS: one table of one phoneme boundary per unit. The boundary
+ * itself (which blend lengths apply, where the interpolation starts) is opened
+ * on the unit that starts it. */
+static int render_blend_step(void)
+{
+    if (!sam_blend_open) {
+        /* get the current and following phoneme */
         Y = phonemeIndexOutput[X];
-        A = phonemeIndexOutput[X+1];
+        A = phonemeIndexOutput[X + 1];
         X++;
 
-        // exit loop at end token
-        if (A == 255) break;//goto pos47970;
+        /* exit loop at end token */
+        if (A == 255)
+            return 0;
 
-
-        // get the ranking of each phoneme
+        /* get the ranking of each phoneme */
         X = A;
         mem56 = blendRank[A];
         A = blendRank[Y];
 
-        // compare the rank - lower rank value is stronger
-        if (A == mem56)
-        {
-            // same rank, so use out blend lengths from each phoneme
+        /* compare the rank - lower rank value is stronger */
+        if (A == mem56) {
+            /* same rank, so use out blend lengths from each phoneme */
             phase1 = outBlendLength[Y];
             phase2 = outBlendLength[X];
-        } else
-        if (A < mem56)
-        {
-            // first phoneme is stronger, so us it's blend lengths
+        } else if (A < mem56) {
+            /* first phoneme is stronger, so use its blend lengths */
             phase1 = inBlendLength[X];
             phase2 = outBlendLength[X];
-        } else
-        {
-            // second phoneme is stronger, so use it's blend lengths
-            // note the out/in are swapped
+        } else {
+            /* second phoneme is stronger, so use its blend lengths;
+             * note the out/in are swapped */
             phase1 = outBlendLength[Y];
             phase2 = inBlendLength[Y];
         }
 
         Y = mem44;
-        A = mem49 + phonemeLengthOutput[mem44]; // A is mem49 + length
-        mem49 = A; // mem49 now holds length + position
-        A = A + phase2; //Maybe Problem because of carry flag
-
-        //47776: ADC 42
+        A = mem49 + phonemeLengthOutput[mem44];   /* mem49 + length */
+        mem49 = A;                       /* mem49 now holds length + position */
+        A = A + phase2;
         speedcounter = A;
-        mem47 = 168;
-        phase3 = mem49 - phase1; // what is mem49
-        A = phase1 + phase2; // total transition?
+        phase3 = mem49 - phase1;
+        A = phase1 + phase2;             /* total transition */
         mem38 = A;
 
         X = A;
         X -= 2;
-        if ((X & 128) == 0)
-        do   //while No. 2
-        {
-            //pos47810:
-
-          // mem47 is used to index the tables:
-          // 168  pitches[]
-          // 169  frequency1
-          // 170  frequency2
-          // 171  frequency3
-          // 172  amplitude1
-          // 173  amplitude2
-          // 174  amplitude3
-
-            mem40 = mem38;
-
-            if (mem47 == 168)     // pitch
-            {
-
-               // unlike the other values, the pitches[] interpolates from
-               // the middle of the current phoneme to the middle of the
-               // next phoneme
-
-                unsigned char mem36, mem37;
-                // half the width of the current phoneme
-                mem36 = phonemeLengthOutput[mem44] >> 1;
-                // half the width of the next phoneme
-                mem37 = phonemeLengthOutput[mem44+1] >> 1;
-                // sum the values
-                mem40 = mem36 + mem37; // length of both halves
-                mem37 += mem49; // center of next phoneme
-                mem36 = mem49 - mem36; // center index of current phoneme
-                A = Read(mem47, mem37); // value at center of next phoneme - end interpolation value
-                //A = mem[address];
-
-                Y = mem36; // start index of interpolation
-                mem53 = A - Read(mem47, mem36); // value to center of current phoneme
-            } else
-            {
-                // value to interpolate to
-                A = Read(mem47, speedcounter);
-                // position to start interpolation from
-                Y = phase3;
-                // value to interpolate from
-                mem53 = A - Read(mem47, phase3);
-            }
-
-            //Code47503(mem40);
-            // ML : Code47503 is division with remainder, and mem50 gets the sign
-
-            // calculate change per frame
-            signed char m53 = (signed char)mem53;
-            mem50 = mem53 & 128;
-            unsigned char m53abs = abs(m53);
-            mem51 = m53abs % mem40; //abs((char)m53) % mem40;
-            mem53 = (unsigned char)((signed char)(m53) / mem40);
-
-            // interpolation range
-            X = mem40; // number of frames to interpolate over
-            Y = phase3; // starting frame
-
-
-            // linearly interpolate values
-
-            mem56 = 0;
-            //47907: CLC
-            //pos47908:
-            while(1)     //while No. 3
-            {
-                A = Read(mem47, Y) + mem53; //carry alway cleared
-
-                mem48 = A;
-                Y++;
-                X--;
-                if(X == 0) break;
-
-                mem56 += mem51;
-                if (mem56 >= mem40)  //???
-                {
-                    mem56 -= mem40; //carry? is set
-                    //if ((mem56 & 128)==0)
-                    if ((mem50 & 128)==0)
-                    {
-                        //47935: BIT 50
-                        //47937: BMI 47943
-                        if(mem48 != 0) mem48++;
-                    } else mem48--;
-                }
-                //pos47945:
-                Write(mem47, Y, mem48);
-            } //while No. 3
-
-            //pos47952:
-            mem47++;
-            //if (mem47 != 175) goto pos47810;
-        } while (mem47 != 175);     //while No. 2
-        //pos47963:
-        mem44++;
-        X = mem44;
-    }  //while No. 1
-
-    //goto pos47701;
-    //pos47970:
-
-    // add the length of this phoneme
-    mem48 = mem49 + phonemeLengthOutput[mem44];
-
-
-// ASSIGN PITCH CONTOUR
-//
-// This subtracts the F1 frequency from the pitch to create a
-// pitch contour. Without this, the output would be at a single
-// pitch level (monotone).
-
-
-    // don't adjust pitch if in sing mode
-    if (!singmode)
-    {
-        // iterate through the buffer
-        for(i=0; i<256; i++) {
-            // subtract half the frequency of the formant 1.
-            // this adds variety to the voice
-            pitches[i] -= (frequency1[i] >> 1);
+        if ((X & 128) != 0) {            /* nothing to interpolate */
+            mem44++;
+            X = mem44;
+            return 1;
         }
+        mem47 = 168;
+        sam_blend_open = 1;
     }
 
-    phase1 = 0;
-    phase2 = 0;
-    phase3 = 0;
-    mem49 = 0;
-    speedcounter = 72; //sam standard speed
-
-// RESCALE AMPLITUDE
-//
-// Rescale volume from a linear scale to decibels.
-//
-
-    //amplitude rescaling
-    for(i=255; i>=0; i--)
+    /* one table pass; mem47 names the table (Read/Write):
+     * 168 pitches, 169-171 frequency1..3, 172-174 amplitude1..3 */
     {
+        //pos47810:
+
+      // mem47 is used to index the tables:
+      // 168  pitches[]
+      // 169  frequency1
+      // 170  frequency2
+      // 171  frequency3
+      // 172  amplitude1
+      // 173  amplitude2
+      // 174  amplitude3
+
+        mem40 = mem38;
+
+        if (mem47 == 168)     // pitch
+        {
+
+           // unlike the other values, the pitches[] interpolates from
+           // the middle of the current phoneme to the middle of the
+           // next phoneme
+
+            unsigned char mem36, mem37;
+            // half the width of the current phoneme
+            mem36 = phonemeLengthOutput[mem44] >> 1;
+            // half the width of the next phoneme
+            mem37 = phonemeLengthOutput[mem44+1] >> 1;
+            // sum the values
+            mem40 = mem36 + mem37; // length of both halves
+            mem37 += mem49; // center of next phoneme
+            mem36 = mem49 - mem36; // center index of current phoneme
+            A = Read(mem47, mem37); // value at center of next phoneme - end interpolation value
+            //A = mem[address];
+
+            Y = mem36; // start index of interpolation
+            mem53 = A - Read(mem47, mem36); // value to center of current phoneme
+        } else
+        {
+            // value to interpolate to
+            A = Read(mem47, speedcounter);
+            // position to start interpolation from
+            Y = phase3;
+            // value to interpolate from
+            mem53 = A - Read(mem47, phase3);
+        }
+
+        //Code47503(mem40);
+        // ML : Code47503 is division with remainder, and mem50 gets the sign
+
+        // calculate change per frame
+        signed char m53 = (signed char)mem53;
+        mem50 = mem53 & 128;
+        unsigned char m53abs = abs(m53);
+        mem51 = m53abs % mem40; //abs((char)m53) % mem40;
+        mem53 = (unsigned char)((signed char)(m53) / mem40);
+
+        // interpolation range
+        X = mem40; // number of frames to interpolate over
+        Y = phase3; // starting frame
+
+
+        // linearly interpolate values
+
+        mem56 = 0;
+        //47907: CLC
+        //pos47908:
+        while(1)     //while No. 3
+        {
+            A = Read(mem47, Y) + mem53; //carry alway cleared
+
+            mem48 = A;
+            Y++;
+            X--;
+            if(X == 0) break;
+
+            mem56 += mem51;
+            if (mem56 >= mem40)  //???
+            {
+                mem56 -= mem40; //carry? is set
+                //if ((mem56 & 128)==0)
+                if ((mem50 & 128)==0)
+                {
+                    //47935: BIT 50
+                    //47937: BMI 47943
+                    if(mem48 != 0) mem48++;
+                } else mem48--;
+            }
+            //pos47945:
+            Write(mem47, Y, mem48);
+        } //while No. 3
+
+        //pos47952:
+        mem47++;
+        //if (mem47 != 175) goto pos47810;
+    }
+    if (mem47 == 175) {
+        sam_blend_open = 0;
+        mem44++;
+        X = mem44;
+    }
+    return 1;
+}
+
+/* ASSIGN PITCH CONTOUR, in slices: subtract half the F1 frequency from the
+ * pitch, so a word has a contour instead of one flat pitch. */
+static void render_contour_slice(void)
+{
+    int i = sam_setup_pos, n = 0;
+    while (i < sam_frames && n < 32) {
+        pitches[i] -= (frequency1[i] >> 1);
+        i++;
+        n++;
+    }
+    sam_setup_pos = i;
+}
+
+/* RESCALE AMPLITUDE, in slices: linear amplitude to decibels, from the last
+ * frame to the first, as SAM did. */
+static void render_rescale_slice(void)
+{
+    int i = sam_setup_pos, n = 0;
+    while (i >= 0 && n < 16) {
         amplitude1[i] = amplitudeRescale[amplitude1[i]];
         amplitude2[i] = amplitudeRescale[amplitude2[i]];
         amplitude3[i] = amplitudeRescale[amplitude3[i]];
+        i--;
+        n++;
     }
+    sam_setup_pos = i;
+}
 
+/* The pulse's start state, for the chunk whose tables are ready. */
+static void render_pulse_begin(void)
+{
     Y = 0;
     A = pitches[0];
     mem44 = A;
     X = A;
     gl_len = sayit_glottal(A);
-    gl_third = gl_len - (gl_len >> 2);   // 3/4*A ???
+    gl_third = gl_len - (gl_len >> 2);   /* 3/4*A ??? */
 
 if (debug)
 {
@@ -2282,15 +2232,85 @@ if (debug)
 // To simulate them being driven by the glottal pulse, the waveforms are
 // reset at the beginning of each glottal pulse.
 
+    sam_setup = 0;
 }
 
-// The glottal-pulse loop. Returns 1 when the ring is full (call again later;
-// every bit of state is intact) and 0 when the chunk has been rendered out.
+/* Advance the chunk's tables by `units` (a phoneme, one table of one blend, or
+ * a handful of frames of the contour or the rescale). Returns 1 while the
+ * tables are still being made. */
+static int render_setup_slice(int units)
+{
+    while (units-- > 0 && sam_setup) {
+        switch (sam_setup_phase) {
+        case 0:                          /* frame list */
+            if (!render_frames_step()) {
+                X = 0;
+                mem44 = 0;
+                mem49 = 0;
+                A = 0;
+                sam_blend_open = 0;
+                sam_setup_phase = 1;
+            }
+            break;
+        case 1:                          /* phoneme boundaries */
+            if (!render_blend_step()) {
+                /* add the length of this phoneme */
+                mem48 = mem49 + phonemeLengthOutput[mem44];
+                phase1 = 0;
+                phase2 = 0;
+                phase3 = 0;
+                mem49 = 0;
+                speedcounter = 72;       /* SAM's standard speed */
+                sam_setup_phase = 2;
+                sam_setup_pos = 0;
+            }
+            break;
+        case 2:                          /* pitch contour */
+            if (singmode)
+                sam_setup_pos = sam_frames;
+            render_contour_slice();
+            if (sam_setup_pos >= sam_frames) {
+                sam_setup_phase = 3;
+                sam_setup_pos = sam_frames - 1;
+            }
+            break;
+        case 3:                          /* amplitude rescale */
+            render_rescale_slice();
+            if (sam_setup_pos < 0)
+                sam_setup_phase = 4;
+            break;
+        default:                         /* the pulse can start */
+            render_pulse_begin();
+            break;
+        }
+    }
+    return sam_setup;
+}
+
+/* For the machine: 1 when the chunk's tables are ready. */
+int sam_voice_ready(void) { return !sam_setup; }
+/* The machine's per-block hook, called every block and not only while the
+ * tables are being made: one slice of them while they are not ready, and in the
+ * block whose slice finishes them, sam_hold, so the ring's first refill lands in
+ * the next block instead. A block then carries ~1 000-2 600 cycles of slice or
+ * one refill, not both - the two together were the note start's worst block. */
+void sam_voice_setup(void)
+{
+    sam_hold = 0;
+    if (!sam_setup)
+        return;
+    if (!render_setup_slice(SAM_SETUP_UNITS))
+        sam_hold = 1;
+}
+
+// The glottal-pulse loop. Returns 1 when the writer is far enough ahead (call
+// again later; every bit of state is intact) and 0 when the chunk has been
+// rendered out.
 static int render_pump(void)
 {
     for(;;)
     {
-        if (sam_ring_space() < 16) return 1;
+        if (sam_ring_full()) return 1;
         if (mem48 == 0) return 0;      /* render_setup found nothing to say */
         if (rs_resume) {
             if (RenderSample(&mem66)) return 1;
@@ -2585,10 +2605,20 @@ static int sam_ring_space(void)
 
 const char *sam_voice_phonemes(void) { return (const char *)input; }
 
-int sam_voice_begin(const char *text, int len, const struct sam_settings *s)
+/* The front half of a note start: the text into the phoneme stream SAMMain
+ * leaves in phonemeindex/phonemeLength/stress. This is the half that costs the
+ * DSP - SAM's reciter and its parsers walk thousands of bytes of tables and
+ * buffers - so the UI task can run it ahead of the trigger (sam_plan_build) and
+ * a note start only copy the result back (sam_voice_begin_plan).
+ *
+ * `s` is the voice's settings, or 0 to leave them as they are: none of them
+ * reaches this half. Speed and the pitch factor are read by the render as it
+ * goes, and mouth and throat make the formant tables, which SetMouthThroat does
+ * (in Init, inside SAMMain). */
+static int sam_text_begin(const char *text, int len, const struct sam_settings *s)
 {
     int i;
-    if (!text || !s || len <= 0)
+    if (!text || len <= 0)
         return 0;
     if (len > 200)
         len = 200;
@@ -2603,14 +2633,23 @@ int sam_voice_begin(const char *text, int len, const struct sam_settings *s)
     input[len] = '[';
     if (!TextToPhonemes(input))
         return 0;
-    speed = s->speed;
-    pitch = s->pitch;
-    mouth = s->mouth;
-    throat = s->throat;
-    singmode = s->sing ? 1 : 0;
-    period_q15 = s->period_q15 ? (unsigned int)s->period_q15 : 32768u;
+    if (s) {
+        speed = s->speed;
+        pitch = s->pitch;
+        mouth = s->mouth;
+        throat = s->throat;
+        singmode = s->sing ? 1 : 0;
+        period_q15 = s->period_q15 ? (unsigned int)s->period_q15 : 32768u;
+    }
     if (!SAMMain())
         return 0;
+    return 1;
+}
+
+/* The render half: the stream is in place, so only the chunk and its frames
+ * have to be made. Both note starts below end here. */
+static int sam_render_begin(void)
+{
     X = 0;
     Y = 0;
     sam_phpos = 0;
@@ -2623,6 +2662,74 @@ int sam_voice_begin(const char *text, int len, const struct sam_settings *s)
     return phonemeIndexOutput[0] != 255;   /* spaces say nothing */
 }
 
+int sam_voice_begin(const char *text, int len, const struct sam_settings *s)
+{
+    if (!s || !sam_text_begin(text, len, s))
+        return 0;
+    return sam_render_begin();
+}
+
+/* A note start from a stream sam_plan_build packed: the UI task's work, copied
+ * back. n phonemes, three bytes each (index, length, stress), in the order
+ * sam_prepare_chunk walks them, with SAMMain's 254 breath markers in place and
+ * no 255 terminator - this writes it. Everything else is what a note start does
+ * anyway, including mouth and throat, which make the formant tables here
+ * because the plan does not carry them. */
+int sam_voice_begin_plan(const unsigned char *plan, int n,
+                         const struct sam_settings *s)
+{
+    int i;
+    if (!s || !plan || n < 0 || n > 254)
+        return 0;
+    for (i = 0; i < n; i++) {
+        phonemeindex[i] = plan[3 * i + 0];
+        phonemeLength[i] = plan[3 * i + 1];
+        stress[i] = plan[3 * i + 2];
+    }
+    phonemeindex[n] = 255;
+    phonemeindex[255] = 255;         /* the guard SAMMain leaves */
+    speed = s->speed;
+    pitch = s->pitch;
+    mouth = s->mouth;
+    throat = s->throat;
+    singmode = s->sing ? 1 : 0;
+    period_q15 = s->period_q15 ? (unsigned int)s->period_q15 : 32768u;
+    /* Init()'s other half: the formant frequencies the mouth and throat set.
+     * Its zeroing of the arrays is the parsers' own business and is not needed
+     * here - the stream below is written whole, and every reader of it stops at
+     * the terminator. A note that repeats the last chunk's THRT/MOUT skips the
+     * rewrite (sam_set_mouth_throat). */
+    sam_set_mouth_throat(mouth, throat);
+    return sam_render_begin();
+}
+
+#ifdef SAM_PLAN_BUILD
+/* One token's phoneme stream, packed for a machine to keep: the half of a note
+ * start that costs the DSP, run on the UI task (sam_api.h). Three bytes a
+ * phoneme into `out`; returns how many, 0 for a text that says nothing, or -1
+ * when it does not fit in `max` bytes - the caller then leaves that token to the
+ * render, which recites it as it did before. */
+int sam_plan_build(const char *text, int len, unsigned char *out, int max)
+{
+    int i, n = 0;
+    if (!out || max < 3)
+        return -1;
+    if (!sam_text_begin(text, len, 0))
+        return 0;
+    for (i = 0; i < 255; i++) {
+        if (phonemeindex[i] == 255)
+            break;
+        if (3 * n + 3 > max)
+            return -1;
+        out[3 * n + 0] = phonemeindex[i];
+        out[3 * n + 1] = phonemeLength[i];
+        out[3 * n + 2] = stress[i];
+        n++;
+    }
+    return n;
+}
+#endif /* SAM_PLAN_BUILD */
+
 int sam_voice_next(void)
 {
     for (;;) {
@@ -2630,6 +2737,21 @@ int sam_voice_next(void)
             return sam_ring[sam_rd++ & (SAM_RING - 1)];
         if (!sam_running)
             return -1;
+        if (sam_setup) {
+            /* The chunk's tables are still being made. The machine makes them
+             * a slice a block (sam_voice_setup_tr), so this call is one of the
+             * samples that waits for them: silence, and no time spent here.
+             * A plain reader makes them now, in this call, as before. */
+            if (sam_sliced)
+                return 128;
+            render_setup_slice(1 << 20);
+            continue;
+        }
+        if (sam_hold)
+            /* The block that finished the tables holds the writer back: its
+             * first refill waits for the next block, so no block carries the
+             * slice and a refill together (sam_voice_setup). */
+            return 128;
         if (render_pump())
             continue;
         if (sam_prepare_chunk()) {

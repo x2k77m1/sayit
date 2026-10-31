@@ -1,7 +1,7 @@
 {
   "id": "sayit",
-  "version": "1.0a",
-  "ele3_version": "1.0a",
+  "version": "1.0b",
+  "ele3_version": "1.0b",
   "license": "GPL-2.0-or-later",
   "title": "SAY IT (Digitone machine)",
   "category": "Sound",
@@ -10,7 +10,10 @@
   "device": "digitone-mk1",
   "os": "1.44",
   "cflags": [
-    "-DPATPTR_AT=0x4138f214"
+    "-DPATPTR_AT=0x4138f214",
+    "-DSAYIT_PLAN_BYTES=3072",
+    "-DSAYIT_NO_RECITE",
+    "-DSAM_SETUP_SLICED"
   ],
   "sources": [
     "engine.c",
@@ -19,6 +22,7 @@
     "../../sam/sam_engine_1.c",
     "../../sam/sam_engine_2.c",
     "../../sam/sam_engine_3.c",
+    "../../sam/sam_engine_plan.c",
     "../../sam/sam_multi.c",
     "../../sam/reciter.c"
   ],

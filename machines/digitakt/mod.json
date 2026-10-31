@@ -1,7 +1,7 @@
 {
   "id": "sayit",
-  "version": "1.0a",
-  "ele3_version": "1.0a",
+  "version": "1.0b",
+  "ele3_version": "1.0b",
   "license": "GPL-2.0-or-later",
   "title": "SAY IT (Digitakt machine)",
   "category": "Sound",
@@ -12,7 +12,10 @@
   "cflags": [
     "-DSAYIT_TRACKS=8",
     "-DSAM_ENGINES=8",
-    "-DSAYIT_EDIT_LEN=20"
+    "-DSAYIT_EDIT_LEN=20",
+    "-DSAYIT_PLAN_BYTES=768",
+    "-DSAYIT_NO_RECITE",
+    "-DSAM_SETUP_SLICED"
   ],
   "sources": [
     "engine.c",
@@ -25,6 +28,7 @@
     "../../sam/sam_engine_5.c",
     "../../sam/sam_engine_6.c",
     "../../sam/sam_engine_7.c",
+    "../../sam/sam_engine_plan.c",
     "../../sam/sam_multi.c",
     "../../sam/reciter.c"
   ],

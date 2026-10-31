@@ -104,6 +104,7 @@ static int32_t sayit_text_w(const char *s)
 extern void sayit_set_phrase(int32_t track, const char *p);
 extern const char *sayit_get_phrase(int32_t track);
 extern void sayit_store_sync(void);
+extern void sayit_plan_tick(void);
 extern int32_t sayit_get_last_token(int32_t track);
 extern int32_t sayit_get_last_count(int32_t track);
 
@@ -254,6 +255,9 @@ int32_t sayit_enc_handler(void *brain, void *ev)
 void sayit_tick(void *ctrl)
 {
     sayit_store_sync();
+    /* The recitation the audio callback would otherwise have to do at a
+     * trigger: one token of one track a tick (sayit_plan_tick). */
+    sayit_plan_tick();
     if (!ctrl)
         return;
     if (sayit_open)

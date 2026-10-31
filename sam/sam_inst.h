@@ -6,18 +6,16 @@
  * word, with both reading the same phrase. The engine's state is file-scope
  * in sam_port.c, which is generated from the upstream source and has to stay
  * recognisable, so rather than rewrite it into a struct, the port is compiled
- * once per track: sam_engine_1.c .. sam_engine_7.c define SAM_SUFFIX and
+ * once per track: sam_engine_1.c .. sam_engine_3.c define SAM_SUFFIX and
  * include this header, which renames every symbol the port defines at file
  * scope, then include sam_port.c. Statics need no renaming (they are already
  * per-compilation); these are the 29 globals the port defines.
  *
- * How many copies a build takes is the machine's SAM_ENGINES: seven extra for
- * the Digitakt's eight audio tracks, three for the Digitone's four. Measured,
- * the Digitone mod is 76 KB of code and 16 KB of state, the Digitakt's 118 KB
- * and 29 KB; both have room to spare in their device's mod RAM. The reciter
- * (sam/reciter.c) stays one copy: it is called only at note start, and it
- * writes through the input buffer it is handed, so its static scratch cannot
- * be shared across a call.
+ * Cost: three extra copies of the port, about 10.5 KB of RAM and 38 KB of
+ * .run. The image has ~1.2 MB of RAM free and 1.6 MB of flash, so four
+ * engines fit with room to spare. The reciter (sam/reciter.c) stays one
+ * copy: it is called only at note start, and it writes through the input
+ * buffer it is handed, so its static scratch cannot be shared across a call.
  */
 #ifndef SAM_INST_H
 #define SAM_INST_H
@@ -35,6 +33,13 @@
 #define sam_voice_next     SAM_NAME(sam_voice_next)
 #define sam_voice_live     SAM_NAME(sam_voice_live)
 #define sam_voice_phonemes SAM_NAME(sam_voice_phonemes)
+#define sam_voice_begin_plan SAM_NAME(sam_voice_begin_plan)
+#define sam_voice_ready   SAM_NAME(sam_voice_ready)
+#define sam_voice_setup   SAM_NAME(sam_voice_setup)
+#define sam_voice_prime   SAM_NAME(sam_voice_prime)
+/* Only the planning copy defines it (SAM_PLAN_BUILD, sam/sam_engine_plan.c);
+ * naming it here costs the track copies nothing. */
+#define sam_plan_build     SAM_NAME(sam_plan_build)
 
 /* 6502-style helpers the port leaves global */
 #define Code47503 SAM_NAME(Code47503)

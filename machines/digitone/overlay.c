@@ -42,6 +42,8 @@ extern int32_t sayit_get_last_count(int32_t track);
 extern int32_t sayit_get_last_note(int32_t track);
 extern int32_t sayit_ui_knob(int32_t k);
 extern int32_t sayit_knob_slot(int32_t k);
+/* One token of the phrase plans, built on this task (sayit.h, "the plan"). */
+extern void sayit_plan_tick(void);
 extern int32_t sayit_fmt_knob(int32_t k, int32_t value, char *buf);
 
 #define KEY_FUNC   1
@@ -737,6 +739,9 @@ void sayit_tick(void *ctrl)
     if (!ctrl)
         return;
     sayit_ticks++;
+    /* The recitation the audio callback would otherwise have to do at a
+     * trigger: one token of one track a tick (sayit_plan_tick). */
+    sayit_plan_tick();
     /* Modal sweep: a menu can eat a release with no brain-screen change. */
     if (sayit_brain) {
         void *bottom = *(void *volatile *)((uint8_t *)sayit_brain + BRAIN_BOTTOM);

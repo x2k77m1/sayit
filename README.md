@@ -31,8 +31,8 @@ SAY IT is distributed as a mod, and nothing else - no OS image. You supply the
 stock OS file Elektron publishes and build a custom OS on your own machine with
 [elekloader](https://github.com/irpina/elekloader):
 
-- **Digitone mk1**, `sayit-1.0a-digitone.elemod`, against the stock **OS 1.44**.
-- **Digitakt mk1**, `sayit-1.0a-digitakt.elemod`, against the stock **OS 1.54**.
+- **Digitone mk1**, `sayit-1.0b-digitone.elemod`, against the stock **OS 1.44**.
+- **Digitakt mk1**, `sayit-1.0b-digitakt.elemod`, against the stock **OS 1.54**.
 
 Each build carries its device in the file name, so both can sit on one release
 page: the name says which unit the file is for, and a build refuses a mod made
@@ -237,8 +237,7 @@ REL some room.
 
 ## The Digitakt machine
 
-**Status: built and checked in the emulator, not yet played on hardware.** Treat
-it as a working port that nobody has heard on a Digitakt.
+**Status: built and checked in the emulator, not yet played on hardware.**
 
 The same speech, in a device built the opposite way round. The Digitone renders
 its FM voices on a second CPU and a machine borrows them; the Digitakt has no
@@ -369,10 +368,10 @@ sh scripts/build.sh digitakt <stock Digitakt OS 1.54 .syx>
 device's stock file; it builds the device's core and companion plus the mod,
 lints the combination, and writes two artifacts to `out/`:
 
-- `out/sayit-1.0a-<device>.elemod` - the file to hand out (`sayit-1.0a-digitone`
-  or `sayit-1.0a-digitakt`) and to feed to elekloader to build a custom
+- `out/sayit-1.0b-<device>.elemod` - the file to hand out (`sayit-1.0b-digitone`
+  or `sayit-1.0b-digitakt`) and to feed to elekloader to build a custom
   firmware. elekloader's own copy stays in `machines/<device>/out/`.
-- `out/sayit-1.44-1.0a.syx` or `out/sayit-1.54-1.0a.syx` - a patched OS image
+- `out/sayit-1.44-1.0b.syx` or `out/sayit-1.54-1.0b.syx` - a patched OS image
   for your own unit. It contains Elektron's firmware, so it is yours alone and
   `out/` is ignored.
 
@@ -381,7 +380,7 @@ repository and licence, so neither is vendored here.
 
 ## Verified
 
-- `python3 tools/sayit_host_test.py` - 139 checks over the real C core, green.
+- `python3 tools/sayit_host_test.py` - 222 checks over the real C core, green.
 - `python3 tools/sam_parity.py` - 20 phrases rendered by SAM and by the port,
   byte-identical.
 - `emu.fwcheck` (digiemu) - each built image boots, settles and runs with no
@@ -397,8 +396,8 @@ repository and licence, so neither is vendored here.
 
 Digitakt machine, in the emulator only:
 
-- `elekloader.lint` - it links as core 4.0 > machine-pages 1.2 > sayit 1.0a,
-  164,448 of 262,144 bytes of the mods' RAM, no sites of its own (every firmware
+- `elekloader.lint` - it links as core 4.0 > machine-pages 1.2 > sayit 1.0b,
+  201,860 of 262,144 bytes of the mods' RAM, no sites of its own (every firmware
   location it uses is a core 3.0 export, so it names no address).
 - The phrase store, in the host tests: a phrase packs into the sound's ten words
   and unpacks again, every character of the alphabet in every position, an empty

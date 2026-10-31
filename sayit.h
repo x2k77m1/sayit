@@ -340,7 +340,19 @@ struct sayit_voice {
      * (engine.c's sayit_live_controls; SAM bakes the rest in per chunk). */
     int32_t note;
     struct sam_settings set;
+    /* A note whose token had no stream yet: the render stays silent and asks
+     * the UI task for it (sayit_plan_want_token) instead of reciting the token
+     * in the audio block. want_idx is -1 when nothing is waiting. */
+    int32_t want_idx;
+    int32_t want_note;
+    int32_t want_wait;  /* blocks spent waiting, bounded by SAYIT_WANT_BLOCKS */
 };
+
+/* How long a note may wait for its token's stream. 48 blocks is 32 ms: a UI
+ * tick or two, and far inside the length of the shortest word, so a note that
+ * is actually going to be planned always gets there. Past this the token is
+ * dropped rather than left holding the track. */
+#define SAYIT_WANT_BLOCKS 48
 
 #define SAYIT_FADE 48        /* samples (~1 ms at 48 kHz) */
 
@@ -357,6 +369,9 @@ static void sayit_voice_init(struct sayit_voice *s)
     s->fade = 0;
     s->level = 0;
     s->note = 0;
+    s->want_idx = -1;
+    s->want_note = 0;
+    s->want_wait = 0;
     s->set.speed = 0;
     s->set.pitch = 0;
     s->set.mouth = 0;
@@ -365,9 +380,33 @@ static void sayit_voice_init(struct sayit_voice *s)
     s->set.period_q15 = 0;
 }
 
+/* The bookkeeping a token that has begun needs, shared by the text start below
+ * and the plan start after it. */
+static void sayit_voice_begun(struct sayit_voice *s, int32_t engine, int32_t first,
+                              const struct sam_settings *st, int32_t gen)
+{
+    s->track = engine;
+    s->active = 1;
+    s->gen = gen;
+    s->pos = 0;
+    s->prev = first;
+    s->cur = first;
+    s->fade = 0;
+    s->level = 0;
+    s->want_idx = -1;
+    s->set = *st;
+}
+
 /* Start a token on track `engine`'s own SAM engine: text/len is the (already
  * expanded) token and the four controls set the voice. pit_steps is in
- * semitones (see sayit_resolve). Returns 1 if anything will sound. */
+ * semitones (see sayit_resolve). Returns 1 if anything will sound.
+ *
+ * A machine never calls this: reciting a token costs SAM's reciter and its
+ * parsers, which no audio block can hold, so a machine starts from the plan
+ * (sayit_voice_start_plan) and waits for it when it is not there yet. The
+ * host tests keep it as the reference the plan path is compared against, so a
+ * machine build defines SAYIT_NO_RECITE and this is not compiled. */
+#ifndef SAYIT_NO_RECITE
 static int32_t sayit_voice_start(struct sayit_voice *s, int32_t engine,
                                  const char *text, int32_t len,
                                  int32_t spd_knob, int32_t pit_steps,
@@ -389,16 +428,297 @@ static int32_t sayit_voice_start(struct sayit_voice *s, int32_t engine,
         s->active = 0;
         return 0;
     }
-    s->track = engine;
-    s->active = 1;
-    s->gen = gen;
-    s->pos = 0;
-    s->prev = first;
-    s->cur = first;
-    s->fade = 0;
-    s->level = 0;
-    s->set = st;
+    sayit_voice_begun(s, engine, first, &st, gen);
     return 1;
+}
+#endif /* SAYIT_NO_RECITE */
+
+/* Start a token from a stream the UI task recited ahead of the note
+ * (sayit_plan): there is no reciting here, only the chunk's frames. */
+static int32_t sayit_voice_start_plan(struct sayit_voice *s, int32_t engine,
+                                      const uint8_t *plan, int32_t nph,
+                                      int32_t spd_knob, int32_t pit_steps,
+                                      int32_t thr_knob, int32_t mou_knob,
+                                      int32_t gen)
+{
+    struct sam_settings st;
+    int32_t first;
+    if (!s)
+        return 0;
+    engine = sayit_clamp32(engine, 0, SAM_ENGINES - 1);
+    sayit_resolve(spd_knob, pit_steps, thr_knob, mou_knob, &st);
+    if (!sam_voice_begin_plan_tr(engine, plan, nph, &st)) {
+        s->active = 0;
+        return 0;
+    }
+    first = sam_voice_next_tr(engine);
+    if (first < 0) {
+        s->active = 0;
+        return 0;
+    }
+    sayit_voice_begun(s, engine, first, &st, gen);
+    return 1;
+}
+
+/* ---- the plan: the recitation done ahead of the trigger ------------------ */
+/* Starting a token costs SAM's reciter and its parsers, which walk thousands of
+ * bytes of tables and buffers. That is not work an audio block can hold: the
+ * render runs at interrupt level, 1500 blocks a second, a 667 us block, and a
+ * machine's code and tables are in DDR, where each of those walks is a bus trip
+ * with no cache in front of it. Reciting inside the render therefore spends a
+ * block's whole budget and more on one trigger, which the unit shows as a DSP
+ * spike and which clips another track's voice.
+ *
+ * So the UI task recites instead: each phrase's tokens become phoneme streams
+ * once, a token a tick (sayit_plan_step), and a note start only copies the
+ * stream it needs into the track's engine (sayit_voice_start_plan). A plan
+ * belongs to the phrase and the mode it was built for; when either moves it is
+ * dropped and built again.
+ *
+ * The render never recites, not even for a token the plan has not reached: a
+ * note that finds no stream goes silent for a block or two and asks for that
+ * token (sayit_plan_want_token), which the next tick builds first. A word can
+ * therefore start a millisecond late; it can never stall an audio block.
+ *
+ * The storage lives in the machine (engine.c declares one per track): this
+ * header is included by more than one file of a machine, so it holds the
+ * helpers and not the plans. */
+#ifndef SAYIT_PLAN_BYTES
+#define SAYIT_PLAN_BYTES 3072      /* per track, in bytes of packed phonemes */
+#endif
+#define SAYIT_PLAN_NONE  0xffff
+
+struct sayit_plan {
+    int32_t  mode;                          /* the mode it was built for, or -1 */
+    uint8_t  done;                          /* every token built */
+    uint8_t  count;                         /* tokens in the phrase */
+    uint8_t  next;                          /* the token the next step builds */
+    uint16_t used;                          /* bytes of `pool` in use */
+    uint16_t toff[SAYIT_TOKENS_MAX];        /* token -> its text in the phrase */
+    uint8_t  tlen[SAYIT_TOKENS_MAX];
+    uint16_t off[SAYIT_TOKENS_MAX];         /* token -> its stream, or NONE */
+    uint8_t  nph[SAYIT_TOKENS_MAX];
+    uint8_t  pool[SAYIT_PLAN_BYTES];
+};
+
+/* Forget the plan: the phrase or the mode it was built for has moved. The
+ * machine calls this where the phrase is set, and the next tick builds again. */
+static void sayit_plan_drop(struct sayit_plan *p)
+{
+    int32_t i;
+    if (!p)
+        return;
+    p->mode = -1;
+    p->done = 0;
+    p->count = 0;
+    p->next = 0;
+    p->used = 0;
+    for (i = 0; i < SAYIT_TOKENS_MAX; i++) {
+        p->toff[i] = 0;
+        p->tlen[i] = 0;
+        p->off[i] = SAYIT_PLAN_NONE;
+        p->nph[i] = 0;
+    }
+}
+
+/* Can the plan answer for this mode? A plan is built a token a tick, so it
+ * answers for the tokens it has built before the walk is done (see
+ * sayit_plan_stream); `done` only says there is nothing left to build. */
+static int32_t sayit_plan_ready(const struct sayit_plan *p, int32_t mode)
+{
+    return p && p->mode == mode;
+}
+
+/* The plan's stream for a token, or 0 when it has none for it: the plan is not
+ * built for this mode yet, that token is later than the walk has reached, or
+ * the pool ran out before it. A note that finds no stream does not recite the
+ * token in the render any more (see sayit_plan_want_token): it asks for that
+ * token and waits. */
+static int32_t sayit_plan_stream(const struct sayit_plan *p, int32_t mode, int32_t idx,
+                                 const uint8_t **stream, uint8_t *nph)
+{
+    if (!sayit_plan_ready(p, mode) || idx < 0 || idx >= (int32_t)p->count)
+        return 0;
+    if (p->off[idx] == SAYIT_PLAN_NONE)
+        return 0;
+    *stream = p->pool + p->off[idx];
+    *nph = p->nph[idx];
+    return 1;
+}
+
+/* Build one token's stream into the plan. 0 when it could not be built (the
+ * pool is full), 1 otherwise; an entry that says nothing is built as an empty
+ * stream, which is a token that plays silence rather than one that is late. */
+static int32_t sayit_plan_token(struct sayit_plan *p, const char *phrase, int32_t i)
+{
+    int32_t k, len, exp_len, n, room;
+    char text[SAYIT_EXPAND_MAX];
+
+    if (!p || i < 0 || i >= (int32_t)p->count)
+        return 0;
+    if (p->off[i] != SAYIT_PLAN_NONE)
+        return 1;                       /* already built */
+    len = p->tlen[i];
+    /* The same text the note start would recite: one character is a letter
+     * name, anything longer is the word itself (see the machines' render). */
+    if (len == 1) {
+        exp_len = sayit_expand_token(phrase + p->toff[i], len, text, sizeof(text));
+    } else {
+        exp_len = len < (int32_t)sizeof(text) - 1
+            ? len : (int32_t)sizeof(text) - 1;
+        for (k = 0; k < exp_len; k++)
+            text[k] = phrase[p->toff[i] + k];
+        text[exp_len] = 0;
+    }
+    if (exp_len <= 0) {                 /* says nothing: an empty entry, not none */
+        p->off[i] = p->used;
+        p->nph[i] = 0;
+        return 1;
+    }
+    room = (int32_t)sizeof(p->pool) - (int32_t)p->used;
+    n = sam_plan_build(text, exp_len, p->pool + p->used, room);
+    if (n < 0)
+        return 0;                       /* the pool is full: no stream */
+    p->off[i] = p->used;
+    p->nph[i] = (uint8_t)n;
+    p->used = (uint16_t)(p->used + 3 * n);
+    return 1;
+}
+
+/* One token a call: the UI task builds a phrase's plan a token a tick, so a
+ * phrase or mode change costs a few hundred microseconds a frame rather than a
+ * stall. Returns 1 while there is more to build. A token whose stream does not
+ * fit the pool is left without one - the render waits for it and then gives
+ * up, which is a dropped token rather than a stall in the audio block. */
+static int32_t sayit_plan_step(struct sayit_plan *p, const char *phrase, int32_t mode)
+{
+    int32_t i;
+
+    if (!p)
+        return 0;
+    if (p->mode != mode) {              /* a new phrase, or a moved MODE */
+        sayit_plan_drop(p);
+        p->mode = mode;
+        p->count = (uint8_t)sayit_tokenise(phrase, mode, p->toff, p->tlen,
+                                           SAYIT_TOKENS_MAX);
+    }
+    if (p->done)
+        return 0;
+    while (p->next < p->count && p->off[p->next] != SAYIT_PLAN_NONE)
+        p->next++;                      /* built already, by a want */
+    if (p->next >= p->count) {
+        p->done = 1;
+        return 0;
+    }
+    i = p->next++;
+    sayit_plan_token(p, phrase, i);
+    return 1;
+}
+
+/* Build one token out of its turn, for a note the render is waiting on.
+ *
+ * A note can arrive before the walk has reached its token: a phrase typed a
+ * moment ago, a project just loaded, a token later in a long phrase than the
+ * walk has got to. The render may not recite it any more - that is the block
+ * the unit cannot hold - so it goes silent and asks for that token, and the
+ * next tick builds that one alone (a few hundred microseconds) instead of the
+ * walk's turn. One tick of delay, then the word starts. */
+static int32_t sayit_plan_want_token(struct sayit_plan *p, const char *phrase,
+                                     int32_t mode, int32_t idx)
+{
+    if (!p)
+        return 0;
+    if (p->mode != mode) {
+        sayit_plan_drop(p);
+        p->mode = mode;
+        p->count = (uint8_t)sayit_tokenise(phrase, mode, p->toff, p->tlen,
+                                           SAYIT_TOKENS_MAX);
+    }
+    if (idx < 0 || idx >= (int32_t)p->count)
+        return 0;
+    return sayit_plan_token(p, phrase, idx);
+}
+
+/* ---- the start of a fresh note ------------------------------------------ */
+
+/* What a fresh note is to start: the plan's stream when the UI task has one for
+ * its token, else the text to recite here. */
+struct sayit_start {
+    const uint8_t *plan;    /* the plan's stream, or 0 */
+    uint8_t  nph;           /* how many phonemes it holds */
+    const char *text;       /* the text to recite, or 0 */
+    int32_t  len;
+    int32_t  count;         /* tokens in the phrase, for the note map */
+    int32_t  idx;           /* the token the note names */
+};
+
+/* Resolve `note` on a track: which token it is, and where the stream for it
+ * comes from. Returns 0 when the note has nothing to say - an empty phrase, or
+ * a note outside C5..C5+count-1 - and the render writes silence. offs, lens and
+ * expanded are the caller's scratch, used only on the paths that recite. */
+static int32_t sayit_start_resolve(struct sayit_start *st, const struct sayit_plan *p,
+                                   const char *phrase, int32_t mode, int32_t note,
+                                   uint16_t *offs, uint8_t *lens,
+                                   char *expanded, int32_t expanded_sz)
+{
+    int32_t count, idx, have;
+#ifndef SAYIT_NO_RECITE
+    int32_t tlen, exp_len, i;
+    const char *tok;
+#endif
+
+    if (!st)
+        return 0;
+    st->plan = 0;
+    st->nph = 0;
+    st->text = 0;
+    st->len = 0;
+    st->idx = -1;
+    st->count = 0;
+    have = sayit_plan_ready(p, mode);
+    if (have)
+        count = (int32_t)p->count;      /* no tokenising in the audio callback */
+    else
+        count = sayit_tokenise(phrase, mode, offs, lens, SAYIT_TOKENS_MAX);
+    st->count = count;
+    idx = sayit_token_for_note(note, SAYIT_BASE, count);
+    if (idx < 0)
+        return 0;
+    st->idx = idx;
+    if (sayit_plan_stream(p, mode, idx, &st->plan, &st->nph))
+        return 1;                       /* recited ahead of the note */
+#ifdef SAYIT_NO_RECITE
+    /* A machine does not recite here: the stream is coming, because the note
+     * asked the UI task for that token (sayit_plan_want_token), and until it
+     * arrives the voice is silent. Nothing below runs in a machine build. */
+    (void)phrase;
+    (void)offs;
+    (void)lens;
+    (void)expanded;
+    (void)expanded_sz;
+    return 1;
+#else
+    if (have) {                         /* the plan knows the token's text */
+        tok = phrase + p->toff[idx];
+        tlen = p->tlen[idx];
+    } else {
+        tok = phrase + offs[idx];
+        tlen = lens[idx];
+    }
+    if (tlen == 1) {
+        exp_len = sayit_expand_token(tok, tlen, expanded, expanded_sz);
+    } else {
+        exp_len = tlen < expanded_sz - 1 ? tlen : expanded_sz - 1;
+        for (i = 0; i < exp_len; i++)
+            expanded[i] = tok[i];
+        expanded[exp_len] = 0;
+    }
+    if (exp_len <= 0)
+        return 0;
+    st->text = expanded;
+    st->len = exp_len;
+    return 1;
+#endif /* SAYIT_NO_RECITE */
 }
 
 /* One Q15 sample at 48 kHz. Bounded work: at most one source sample and one

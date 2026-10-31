@@ -75,6 +75,17 @@ static int32_t sayit_gen[SAYIT_TRACKS];   /* newest-note generation, per track *
 static int32_t sayit_last_tok[SAYIT_TRACKS] = { -1, -1, -1, -1 };
 static int32_t sayit_last_n[SAYIT_TRACKS];
 static int32_t sayit_last_note[SAYIT_TRACKS] = { -1, -1, -1, -1 };
+/* The plan: each track's phrase recited ahead of the trigger, a token a tick,
+ * so that the audio callback never has to recite (sayit.h, "the plan"). The
+ * storage is the machine's because sayit.h is included by more than one file
+ * of a machine. */
+static struct sayit_plan sayit_pl[SAYIT_TRACKS];
+static int32_t sayit_plan_slot;
+static int32_t sayit_prime_slot;   /* which engine's formant tables a tick makes */
+/* The token a track's render is silent for, or -1: a note that found no stream
+ * in its plan. The next tick builds that token first (sayit_plan_tick), so the
+ * wait is a tick rather than the rest of the walk. */
+static int32_t sayit_want[SAYIT_TRACKS] = { -1, -1, -1, -1 };
 
 static int32_t sayit_track(int32_t t)
 {
@@ -174,8 +185,13 @@ static const struct dnm_knob sayit_knobs[DNM_KNOBS] = {
  * never corrupt another track's phrase. */
 void sayit_set_phrase(int32_t track, const char *p)
 {
-    char *dst = sayit_phrase[sayit_track(track)];
+    int32_t t = sayit_track(track);
+    char *dst = sayit_phrase[t];
     int32_t i = 0;
+    /* The plan was built from the old phrase: drop it before the new one is in
+     * place, so no note can start from a stream that belongs to what was there
+     * before. The next tick builds it again. */
+    sayit_plan_drop(&sayit_pl[t]);
     if (!p) {
         dst[0] = 0;
         return;
@@ -217,16 +233,69 @@ int32_t sayit_knob_slot(int32_t k)
     return (slot < 0 || slot > 78) ? -1 : slot;
 }
 
-int32_t sayit_ui_knob(int32_t k)
+/* A track's SYN knob value, for a UI reader that is not looking at the active
+ * track: the plan is built for the mode every track will play. */
+int32_t sayit_ui_knob_track(int32_t t, int32_t k)
 {
     uint8_t *kit = fw_kit;
-    int32_t t = fw_active_track, slot;
-    if (!kit || t < 0 || t > 3)
+    int32_t slot;
+    if (!kit || t < 0 || t >= SAYIT_TRACKS)
         return 0;
     slot = sayit_knob_slot(k);
     if (slot < 0)
         return 0;
     return FW_SOUND_SLOT(kit, t, slot);
+}
+
+int32_t sayit_ui_knob(int32_t k)
+{
+    return sayit_ui_knob_track((int32_t)fw_active_track, k);
+}
+
+/* ---- the plan, one token a tick ----------------------------------------- */
+/* The recitation the audio callback must not do (sayit.h, "the plan"): the UI
+ * task builds one token of one track's plan per tick, round-robin over the
+ * tracks, so a phrase change or a project load plans every track without any
+ * single tick carrying more than one token's worth of work. */
+void sayit_plan_tick(void)
+{
+    int32_t t, w;
+
+    /* The formant tables, made here rather than in the note's first block:
+     * THRT and MOUT rewrite 32 table entries through trans() (~12 700
+     * cycles), which is what a note start still carries on its own. The UI
+     * task has the time, and the note that follows finds the pair ready
+     * (sam_voice_prime_tr), so its block holds only the chunk's frames. One
+     * track a tick, so a load spells all four engines over four ticks rather
+     * than putting four table builds in one. A pair a p-lock or an LFO moves
+     * between the tick and the note is still made at the note start. */
+    {
+        struct sam_settings ps;
+        int32_t p = sayit_track(sayit_prime_slot);
+        sayit_prime_slot = (p + 1) % SAYIT_TRACKS;
+        sayit_resolve(sayit_map_speed(sayit_ui_knob_track(p, K_SPD) >> 8), 0,
+                      sayit_map_voice(sayit_ui_knob_track(p, K_THRT) >> 8),
+                      sayit_map_voice(sayit_ui_knob_track(p, K_MOUT) >> 8),
+                      &ps);
+        sam_voice_prime_tr(p, &ps);
+    }
+
+    /* A note the render is silent for jumps the walk: build that one token
+     * now, this tick, so the wait is a tick and not a turn of the round
+     * robin (sayit.h, sayit_plan_want_token). */
+    for (t = 0; t < SAYIT_TRACKS; t++) {
+        w = sayit_want[t];
+        if (w < 0)
+            continue;
+        sayit_want[t] = -1;
+        sayit_plan_want_token(&sayit_pl[t], sayit_phrase[t],
+                              sayit_map_mode(sayit_ui_knob_track(t, K_MODE)), w);
+        return;
+    }
+    t = sayit_track(sayit_plan_slot);
+    sayit_plan_slot = (t + 1) % SAYIT_TRACKS;
+    sayit_plan_step(&sayit_pl[t], sayit_phrase[t],
+                    sayit_map_mode(sayit_ui_knob_track(t, K_MODE)));
 }
 
 /* ---- the system LFOs ---------------------------------------------------- */
@@ -314,7 +383,8 @@ static void sayit_render(int32_t voice, int32_t *block, const struct dnm_voice *
     uint8_t lens[SAYIT_TOKENS_MAX];
     char expanded[SAYIT_EXPAND_MAX];
     const char *phrase;
-    int32_t exp_len, spd, pit, thr, mou;
+    int32_t spd, pit, thr, mou;
+    struct sayit_start start;
     struct sayit_voice *s;
 
     if (voice < 0 || voice > 7 || !block || !v)
@@ -334,9 +404,13 @@ static void sayit_render(int32_t voice, int32_t *block, const struct dnm_voice *
         mode = sayit_map_mode(sayit_knob(voice, K_MODE));
         note = (v->pitch >> 16) & 127;
         sayit_last_note[tr] = note;
-        count = sayit_tokenise(phrase, mode, offs, lens, SAYIT_TOKENS_MAX);
-        idx = sayit_token_for_note(note, SAYIT_BASE, count);
-        if (idx < 0) {
+        /* The token the note names, and the stream for it: the UI task's plan
+         * when it has one, which is the note start with no reciting in this
+         * callback at all (sayit.h, "the plan"). No reciting means that a
+         * token the plan has not reached yet leaves the voice waiting, not
+         * stalled: see the want below. */
+        if (!sayit_start_resolve(&start, &sayit_pl[tr], phrase, mode, note,
+                                 offs, lens, expanded, (int32_t)sizeof(expanded))) {
             /* An empty phrase, or a note outside C5..C5+count-1, is
              * silent; a fresh silent note must not steal this track's
              * owner (another track keeps sounding regardless). */
@@ -346,52 +420,96 @@ static void sayit_render(int32_t voice, int32_t *block, const struct dnm_voice *
             sayit_silence(block);
             return;
         }
-        {
-            const char *tok = phrase + offs[idx];
-            int32_t tlen = lens[idx];
-            if (tlen == 1) {
-                exp_len = sayit_expand_token(tok, tlen, expanded, sizeof(expanded));
-            } else {
-                exp_len = tlen < (int32_t)sizeof(expanded) - 1
-                    ? tlen : (int32_t)sizeof(expanded) - 1;
-                for (i = 0; i < exp_len; i++)
-                    expanded[i] = tok[i];
-                expanded[exp_len] = 0;
+        count = start.count;
+        idx = start.idx;
+        /* newest note wins on this track only: the other tracks'
+         * voices and engines are untouched, so T1 keeps talking
+         * while T2 starts. */
+        s->track = tr;                  /* so a newer note can clear this one */
+        for (i = 0; i < 8; i++)
+            if (i != voice && sayit_v[i].track == tr) {
+                sayit_v[i].active = 0;
+                sayit_v[i].want_idx = -1;
             }
-            if (exp_len > 0) {
-                /* newest note wins on this track only: the other tracks'
-                 * voices and engines are untouched, so T1 keeps talking
-                 * while T2 starts. */
-                for (i = 0; i < 8; i++)
-                    if (i != voice && sayit_v[i].track == tr)
-                        sayit_v[i].active = 0;
-                spd = sayit_map_speed(sayit_knob(voice, K_SPD) >> 8);
-                /* C5 is both token 0 and the untransposed speech note, so
-                 * token sequencing and the pitch climb together. */
-                pit = sayit_pitch_steps_for_note(
-                    note, SAYIT_BASE, sayit_knob(voice, K_PIT) >> 8);
-                thr = sayit_map_voice(sayit_knob(voice, K_THRT) >> 8);
-                mou = sayit_map_voice(sayit_knob(voice, K_MOUT) >> 8);
-                sayit_gen[tr]++;
-                sayit_owner[tr] = voice;
-                sayit_last_tok[tr] = idx;
-                sayit_last_n[tr] = count;
-                s->note = note;
-                sayit_voice_start(s, tr, expanded, exp_len, spd, pit, thr,
-                                  mou, sayit_gen[tr]);
-            } else {
-                s->active = 0;
-                sayit_silence(block);
-                return;
-            }
+        spd = sayit_map_speed(sayit_knob(voice, K_SPD) >> 8);
+        /* C5 is both token 0 and the untransposed speech note, so
+         * token sequencing and the pitch climb together. */
+        pit = sayit_pitch_steps_for_note(
+            note, SAYIT_BASE, sayit_knob(voice, K_PIT) >> 8);
+        thr = sayit_map_voice(sayit_knob(voice, K_THRT) >> 8);
+        mou = sayit_map_voice(sayit_knob(voice, K_MOUT) >> 8);
+        sayit_gen[tr]++;
+        sayit_owner[tr] = voice;
+        sayit_last_tok[tr] = idx;
+        sayit_last_n[tr] = count;
+        s->note = note;
+        if (start.plan) {
+            s->want_idx = -1;
+            sayit_voice_start_plan(s, tr, start.plan, start.nph, spd, pit, thr,
+                                   mou, sayit_gen[tr]);
+            if (!s->active)
+                sayit_owner[tr] = -1;   /* nothing to say: free the track */
+        } else {
+            /* The plan has no stream for this token yet. Reciting it here is
+             * the block the unit cannot hold, so the voice is silent and the
+             * UI task is asked for that token instead; the word starts a tick
+             * later (SAYIT_WANT_BLOCKS bounds the wait). */
+            s->active = 0;
+            s->want_idx = idx;
+            s->want_note = note;
+            s->want_wait = 0;
+            sayit_want[tr] = idx;
         }
     }
 
     /* Mono per track: only this track's newest note's voice sounds. */
-    if (sayit_owner[tr] != voice || !s->active) {
+    if (sayit_owner[tr] != voice) {
         sayit_silence(block);
         return;
     }
+
+    /* A note waiting for its stream: start it the moment the plan has one. */
+    if (!s->active && s->want_idx >= 0) {
+        const uint8_t *plan;
+        uint8_t nph;
+        mode = sayit_map_mode(sayit_knob(voice, K_MODE));
+        if (sayit_plan_stream(&sayit_pl[tr], mode, s->want_idx, &plan, &nph)) {
+            spd = sayit_map_speed(sayit_knob(voice, K_SPD) >> 8);
+            pit = sayit_pitch_steps_for_note(
+                s->want_note, SAYIT_BASE, sayit_knob(voice, K_PIT) >> 8);
+            thr = sayit_map_voice(sayit_knob(voice, K_THRT) >> 8);
+            mou = sayit_map_voice(sayit_knob(voice, K_MOUT) >> 8);
+            s->want_idx = -1;
+            sayit_voice_start_plan(s, tr, plan, nph, spd, pit, thr, mou,
+                                   sayit_gen[tr]);
+            if (!s->active) {
+                sayit_owner[tr] = -1;
+                sayit_silence(block);
+                return;
+            }
+        } else if (++s->want_wait > SAYIT_WANT_BLOCKS) {
+            s->want_idx = -1;           /* nothing to say: give the track back */
+            sayit_owner[tr] = -1;
+            sayit_silence(block);
+            return;
+        } else {
+            sayit_silence(block);
+            return;
+        }
+    }
+    if (!s->active) {
+        sayit_silence(block);
+        return;
+    }
+
+    /* A token's tables (its frames, their blend tables, the contour) are made
+     * a slice a block, not all in the block that starts the note: the engine
+     * says silence until they are ready, so the word starts a millisecond or
+     * two late instead of stalling this block (sam_port.c, "a chunk's tables,
+     * made in slices"). Called every block, not only while they are being
+     * made: it is also the tick that lets the ring's writer back in, which is
+     * what keeps a slice and a refill out of the same block. */
+    sam_voice_setup_tr(tr);
 
     sayit_live_controls(voice, s);
 
