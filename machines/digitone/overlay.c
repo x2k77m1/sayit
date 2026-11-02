@@ -44,6 +44,7 @@ extern int32_t sayit_ui_knob(int32_t k);
 extern int32_t sayit_knob_slot(int32_t k);
 /* One token of the phrase plans, built on this task (sayit.h, "the plan"). */
 extern void sayit_plan_tick(void);
+extern const struct sayit_plan *sayit_plan_for(int32_t track);
 extern int32_t sayit_fmt_knob(int32_t k, int32_t value, char *buf);
 
 #define KEY_FUNC   1
@@ -123,6 +124,9 @@ static uint32_t sayit_swallow_until = 0;
 static uint32_t sayit_msg_until = 0;
 static uint32_t sayit_sig = 0;
 static int32_t sayit_sig_valid = 0;
+static int32_t sayit_ed_dirty = 0;
+static uint32_t sayit_ed_hash = 0;
+static int32_t sayit_ed_cache = 0;
 static int32_t sayit_enc_acc = 0;
 static struct sayit_save sayit_save;
 
@@ -223,20 +227,41 @@ static int32_t sayit_cur_track(void)
     return fw_active_track;
 }
 
-/* True while the buffer differs from what the engine plays. */
+static void sayit_ed_touch(void)
+{
+    sayit_ed_cache = 0;
+}
+
+/* True while the buffer differs from what the engine plays. The scan and the
+ * hash are cached until a mutation calls sayit_ed_touch(); the editor repaints
+ * every tick, so this is what keeps it from rescanning the phrase each frame. */
 static int32_t sayit_dirty(void)
 {
-    const char *p = sayit_get_phrase(sayit_cur_track());
-    int32_t i;
-    if (!sayit_ed_live)
+    const char *p;
+    int32_t i, d = 0;
+    if (sayit_ed_cache)
+        return sayit_ed_dirty;
+    if (!sayit_ed_live) {
+        sayit_ed_hash = sayit_hash(sayit_ed.buf, sayit_ed.len);
+        sayit_ed_dirty = 0;
+        sayit_ed_cache = 1;
         return 0;
+    }
+    p = sayit_get_phrase(sayit_cur_track());
     for (i = 0; i <= sayit_ed.len; i++) {
-        if (sayit_ed.buf[i] != p[i])
-            return 1;
+        if (sayit_ed.buf[i] != p[i]) {
+            d = 1;
+            break;
+        }
         if (p[i] == 0)
             break;
     }
-    return p[i] != 0;
+    if (!d)
+        d = p[i] != 0;
+    sayit_ed_dirty = d;
+    sayit_ed_hash = sayit_hash(sayit_ed.buf, sayit_ed.len);
+    sayit_ed_cache = 1;
+    return d;
 }
 
 /* ---- project data ------------------------------------------------------- */
@@ -276,6 +301,7 @@ static void sayit_loaded(int32_t found)
     sayit_editor_open = 0;
     sayit_popup = 0;
     sayit_ed_live = 0;
+    sayit_ed_touch();
     sayit_enc_acc = 0;
     sayit_sig_valid = 0;
 }
@@ -291,6 +317,7 @@ static void sayit_open_editor(void)
 {
     sayit_ed_track = sayit_cur_track();
     sayit_ed_set(&sayit_ed, sayit_get_phrase(sayit_ed_track));
+    sayit_ed_touch();
     sayit_ed_live = 1;
     sayit_editor_open = 1;
     sayit_popup = 0;
@@ -316,6 +343,7 @@ static void sayit_close_editor(int32_t save)
     } else {
         sayit_ed_set(&sayit_ed, sayit_get_phrase(t));
     }
+    sayit_ed_touch();
     sayit_editor_open = 0;
     sayit_popup = 0;
     sayit_func_action = 0;
@@ -434,10 +462,15 @@ static void sayit_draw_name_screen(void *bmp)
 
     /* token count for the status column */
     {
-        uint16_t offs[SAYIT_TOKENS_MAX];
-        uint8_t lens[SAYIT_TOKENS_MAX];
-        n = sayit_tokenise(p, sayit_map_mode(sayit_ui_knob(K_MODE)), offs,
-                           lens, SAYIT_TOKENS_MAX);
+        int32_t mode = sayit_map_mode(sayit_ui_knob(K_MODE));
+        const struct sayit_plan *pl = sayit_plan_for(sayit_cur_track());
+        if (sayit_plan_ready(pl, mode)) {
+            n = (int32_t)pl->count;
+        } else {
+            uint16_t offs[SAYIT_TOKENS_MAX];
+            uint8_t lens[SAYIT_TOKENS_MAX];
+            n = sayit_tokenise(p, mode, offs, lens, SAYIT_TOKENS_MAX);
+        }
     }
 
     if (sayit_popup) {
@@ -615,11 +648,10 @@ static const int32_t sayit_page_knobs[2][4] = {
  * shrank under the value told the player nothing they could not read, so it
  * is left out. A step-locked knob shows the step's value on an
  * inverted cell, as the manual's p-lock display does. */
-static void sayit_draw_cell(void *bmp, int32_t x, int32_t k, int32_t step)
+static void sayit_draw_cell(void *bmp, int32_t x, int32_t k, int32_t v,
+                            int32_t locked)
 {
     int32_t w = 26;
-    int32_t locked = 0;
-    int32_t v = sayit_shown(k, step, &locked);
     char val[12];
     const char *lbl = "";
     switch (k) {
@@ -645,16 +677,36 @@ static void sayit_draw_page(void *bmp, int32_t key)
 {
     int32_t track = sayit_track_of(fw_active_track);
     const char *phrase = sayit_get_phrase(track);
-    uint16_t offs[SAYIT_TOKENS_MAX];
-    uint8_t lens[SAYIT_TOKENS_MAX];
-    int32_t count, focus, mode, i, step, locked = 0;
+    uint16_t offs_buf[SAYIT_TOKENS_MAX];
+    uint8_t lens_buf[SAYIT_TOKENS_MAX];
+    const uint16_t *offs;
+    const uint8_t *lens;
+    const struct sayit_plan *pl;
+    int32_t count, focus, mode, i, step;
+    int32_t sv[DNM_KNOBS];
+    int32_t sl[DNM_KNOBS];
     char pwin[34], strip[44], text[40], num[8];
 
     /* A held step's locks stand in for the kit while the page is up, so the
      * phrase, the token count and the cells all describe that one step. */
     step = sayit_held_step();
-    mode = sayit_map_mode(sayit_shown(K_MODE, step, &locked));
-    count = sayit_tokenise(phrase, mode, offs, lens, SAYIT_TOKENS_MAX);
+    sv[K_PIT]  = sayit_shown(K_PIT, step, &sl[K_PIT]);
+    sv[K_SPD]  = sayit_shown(K_SPD, step, &sl[K_SPD]);
+    sv[K_MODE] = sayit_shown(K_MODE, step, &sl[K_MODE]);
+    sv[K_THRT] = sayit_shown(K_THRT, step, &sl[K_THRT]);
+    sv[K_MOUT] = sayit_shown(K_MOUT, step, &sl[K_MOUT]);
+    mode = sayit_map_mode(sv[K_MODE]);
+    pl = sayit_plan_for(track);
+    if (sayit_plan_ready(pl, mode)) {
+        count = (int32_t)pl->count;
+        offs = pl->toff;
+        lens = pl->tlen;
+    } else {
+        count = sayit_tokenise(phrase, mode, offs_buf, lens_buf,
+                               SAYIT_TOKENS_MAX);
+        offs = offs_buf;
+        lens = lens_buf;
+    }
     focus = sayit_get_last_token(track);
     if (focus < 0 || focus >= count)
         focus = 0;
@@ -706,14 +758,13 @@ static void sayit_draw_page(void *bmp, int32_t key)
             fw_textf(bmp, FONT5, SAYIT_X, TY(32, 5), -1, "T%d/%d %s",
                      (int)focus + 1, (int)count, text);
         } else if (key == 1) {
-            int32_t v = sayit_shown(K_SPD, step, &locked);
-            sayit_fmt_knob(K_PIT, sayit_shown(K_PIT, step, &locked), num);
-            sayit_fmt_knob(K_SPD, v, text);
+            sayit_fmt_knob(K_PIT, sv[K_PIT], num);
+            sayit_fmt_knob(K_SPD, sv[K_SPD], text);
             fw_textf(bmp, FONT5, SAYIT_X, TY(32, 5), -1, "PIT %s  SPD %s",
                      num, text);
         } else {
-            sayit_fmt_knob(K_THRT, sayit_shown(K_THRT, step, &locked), num);
-            sayit_fmt_knob(K_MOUT, sayit_shown(K_MOUT, step, &locked), text);
+            sayit_fmt_knob(K_THRT, sv[K_THRT], num);
+            sayit_fmt_knob(K_MOUT, sv[K_MOUT], text);
             fw_textf(bmp, FONT5, SAYIT_X, TY(32, 5), -1, "THRT %s  MOUT %s",
                      num, text);
         }
@@ -725,7 +776,7 @@ static void sayit_draw_page(void *bmp, int32_t key)
         int32_t k = sayit_page_knobs[key == 1 ? 0 : 1][i];
         if (k < 0)
             continue;
-        sayit_draw_cell(bmp, SAYIT_CELL_X + i * 28, k, step);
+        sayit_draw_cell(bmp, SAYIT_CELL_X + i * 28, k, sv[k], sl[k]);
     }
 }
 
@@ -733,7 +784,7 @@ static void sayit_draw_page(void *bmp, int32_t key)
 
 void sayit_tick(void *ctrl)
 {
-    int32_t tok, n, key, show;
+    int32_t tok, n, key, show, dirty;
     uint32_t sig;
 
     if (!ctrl)
@@ -780,7 +831,7 @@ void sayit_tick(void *ctrl)
     key = sayit_showing_key();
     show = sayit_is_sayit_track() && (key == 1 || key == 2) &&
         (int32_t)(sayit_ticks - sayit_msg_until) >= 0;
-    {
+    if (show || sayit_editor_open || sayit_repaint > 0) {
         /* Hash what the page would paint: a held step's locks stand in for
          * the kit, so holding or releasing a trig that locks a knob re-arms
          * the frame. The pattern's lock table is only read while the page is
@@ -794,24 +845,27 @@ void sayit_tick(void *ctrl)
             kv = kv * 33u + ((uint32_t)v & 0xffffu) +
                 ((uint32_t)locked << 16);
         }
+        dirty = sayit_dirty();
         sig = ((uint32_t)(sayit_editor_open ? 1 : 0) << 31)
             ^ ((uint32_t)(sayit_popup ? 1 : 0) << 30)
             ^ ((uint32_t)(show ? key : 0) << 28)
             ^ ((uint32_t)((fw_active_track + 1) & 15) << 24)
             ^ ((uint32_t)(sayit_toast > 0 ? 1 : 0) << 27)
-            ^ ((uint32_t)(sayit_dirty() ? 1 : 0) << 26)
+            ^ ((uint32_t)(dirty ? 1 : 0) << 26)
             ^ ((uint32_t)(nm ? 1 : 0) << 25)   /* a popup went up/down */
             ^ ((uint32_t)(sayit_shown_note + 2) << 8)
             ^ ((uint32_t)(sayit_ed.cursor + 1) << 18)
             ^ ((uint32_t)(sayit_ed.grid_row * SAYIT_GRID_COLS + sayit_ed.grid_col + 1) << 10)
-            ^ (sayit_hash(sayit_ed.buf, sayit_ed.len) & 0x3ff)
+            ^ (sayit_ed_hash & 0x3ff)
             ^ (uint32_t)(sayit_shown_tok + 17)
             ^ kv;
-    }
-    if (!sayit_sig_valid || sig != sayit_sig) {
-        sayit_sig = sig;
-        sayit_sig_valid = 1;
-        *((unsigned char *)ctrl + 0x20) = 1; /* re-arm once per change */
+        if (!sayit_sig_valid || sig != sayit_sig) {
+            sayit_sig = sig;
+            sayit_sig_valid = 1;
+            *((unsigned char *)ctrl + 0x20) = 1; /* re-arm once per change */
+        }
+    } else if (sayit_sig_valid) {
+        sayit_sig_valid = 0;
     }
     /* A modal screen and the frame after it are the stock's to overwrite:
      * ask for a frame every tick until the page has settled again. */
@@ -853,6 +907,7 @@ void sayit_draw(void *bmp, void *ctrl)
         return; /* copy/paste/clear toast keeps the frame */
     if (!sayit_ed_live) {
         sayit_ed_set(&sayit_ed, sayit_get_phrase(sayit_track_of(fw_active_track)));
+        sayit_ed_touch();
         sayit_ed_live = 1;
     }
     sayit_draw_page(bmp, key);
@@ -873,8 +928,10 @@ static int32_t sayit_editor_key(int32_t id, int32_t flags)
         int32_t pressed = (flags & 1) || (flags & 8);
         if (!pressed) {
             if (sayit_popup) {
-                if (!sayit_func_action)
+                if (!sayit_func_action) {
                     sayit_ed_grid_accept(&sayit_ed);
+                    sayit_ed_touch();
+                }
                 sayit_popup = 0;
             }
             sayit_func_action = 0;
@@ -900,11 +957,13 @@ static int32_t sayit_editor_key(int32_t id, int32_t flags)
         if (id == KEY_DOWN)  { sayit_ed_grid_move(&sayit_ed, 0, 1); return 1; }
         if (id == KEY_YES) {
             sayit_ed_space(&sayit_ed);
+            sayit_ed_touch();
             sayit_func_action = 1;
             return 1;
         }
         if (id == KEY_NO) {
             sayit_ed_backspace(&sayit_ed);
+            sayit_ed_touch();
             sayit_func_action = 1;
             return 1;
         }
@@ -914,8 +973,8 @@ static int32_t sayit_editor_key(int32_t id, int32_t flags)
         return 1;
     if (id == KEY_LEFT)  { sayit_ed_move(&sayit_ed, -1); return 1; }
     if (id == KEY_RIGHT) { sayit_ed_move(&sayit_ed, 1); return 1; }
-    if (id == KEY_UP)    { sayit_ed_step(&sayit_ed, 1); return 1; }
-    if (id == KEY_DOWN)  { sayit_ed_step(&sayit_ed, -1); return 1; }
+    if (id == KEY_UP)    { sayit_ed_step(&sayit_ed, 1); sayit_ed_touch(); return 1; }
+    if (id == KEY_DOWN)  { sayit_ed_step(&sayit_ed, -1); sayit_ed_touch(); return 1; }
     if (id == KEY_YES || id == KEY_NO) {
         sayit_swallow = id;
         sayit_swallow_until = sayit_ticks + 30;
@@ -1033,6 +1092,7 @@ int32_t sayit_enc_handler(void *brain, void *ev)
                 int32_t i, n = step > 0 ? step : -step;
                 for (i = 0; i < n; i++)
                     sayit_ed_step(&sayit_ed, step > 0 ? 1 : -1);
+                sayit_ed_touch();
             }
             sayit_sig_valid = 0;
         }

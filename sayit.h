@@ -66,6 +66,12 @@ static int32_t sayit_clamp32(int32_t v, int32_t lo, int32_t hi)
     return v;
 }
 
+/* floor(a / 3) for 0 <= a <= 8191: Q14 reciprocal of 1/3, exact here. */
+static int32_t sayit_div3(int32_t a)
+{
+    return (a * 5462) >> 14;
+}
+
 /* The unit's note name: the letter for note % 12 and the number note / 12,
  * so 60 is C5 and 72 is C6, which is what the Digitone's own screens print.
  * buf must hold 5 bytes ("C#11" + NUL). Returns buf ("" for a null buf). */
@@ -355,6 +361,9 @@ struct sayit_voice {
 #define SAYIT_WANT_BLOCKS 48
 
 #define SAYIT_FADE 48        /* samples (~1 ms at 48 kHz) */
+#if SAYIT_FADE != 48
+#error "sayit_frame's fade math assumes SAYIT_FADE == 48"
+#endif
 
 static void sayit_voice_init(struct sayit_voice *s)
 {
@@ -730,7 +739,7 @@ static int32_t sayit_frame(struct sayit_voice *s)
     if (!s || !s->active)
         return 0;
     s->pos += SAYIT_STEP;
-    while (s->pos >= 65536) {
+    if (s->pos >= 65536) {
         s->pos -= 65536;
         s->prev = s->cur;
         n = sam_voice_next_tr(s->track);
@@ -738,14 +747,17 @@ static int32_t sayit_frame(struct sayit_voice *s)
             /* SAM's stream is done: hold the last sample and fade out. */
             if (s->fade == 0)
                 s->fade = SAYIT_FADE;
-            break;
+        } else {
+            s->cur = n;
         }
-        s->cur = n;
     }
     out = s->prev + (((s->cur - s->prev) * s->pos) >> 16);   /* 0..255 */
     out = (out - 128) << 8;                                 /* Q15 */
     if (s->fade > 0) {
-        out = (out * s->fade) / SAYIT_FADE;
+        int32_t p = (out >> 8) * s->fade;
+        int32_t a = p < 0 ? -p : p;
+        int32_t q = 5 * a + sayit_div3(a);
+        out = p < 0 ? -q : q;
         s->level = out;
         s->fade--;
         if (s->fade == 0)
@@ -754,6 +766,26 @@ static int32_t sayit_frame(struct sayit_voice *s)
         s->level = out;
     }
     return out;
+}
+
+/* One 32-sample render block for an active voice. The fade count says exactly
+ * how many samples are left before the voice clears, so the caller never has
+ * to test `active` between samples: with no fade running the voice cannot
+ * clear inside the block (a new fade starts at SAYIT_FADE and can drop by at
+ * most 31), and with a fade running it clears after `fade` samples. Returns the
+ * samples written; the caller zeroes the rest. */
+static int32_t sayit_render_block(struct sayit_voice *s, int32_t *dst,
+                                  int32_t shift)
+{
+    int32_t n = 32, i;
+    if (s->fade > 0 && s->fade < n)
+        n = s->fade;
+    for (i = 0; i < n; i++) {
+        int32_t q = sayit_frame(s);
+        q = (q * 5) >> 3;
+        dst[i] = q << shift;
+    }
+    return n;
 }
 
 #endif /* SAYIT_H */

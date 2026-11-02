@@ -53,7 +53,7 @@ static unsigned char A, X, Y;
 static void PrintRule(unsigned short r) { (void)r; }
 
 """
-open("sam/reciter.c", "w").write(REC_HEAD + rec)
+open("sam/reciter.c", "w", newline="\n").write(REC_HEAD + rec)
 
 # ---------------------------------------------------------------- engine ----
 core = open(os.path.join(SRC, "sam.c")).read()
@@ -247,23 +247,41 @@ rend = rend[:o0] + """/* SAM wrote its 8-bit output into a 220 KB malloc'd buffe
 #define SAM_RING 256
 static unsigned char sam_ring[SAM_RING];
 static uint32_t sam_wr, sam_rd, sam_valid;
-static uint32_t sam_bufpos;
+static uint32_t sam_base, sam_rem;
 static unsigned char oldtimetableindex;
+
+static const unsigned char timetable_q[5][5] = {
+    {3, 3, 3, 2, 2},
+    {4, 1, 1, 0, 0},
+    {4, 1, 1, 0, 0},
+    {4, 0, 0, 1, 1},
+    {3, 0, 0, 1, 1}
+};
+static const unsigned char timetable_r[5][5] = {
+    {12, 17, 17, 27, 28},
+    {26, 10, 10, 0, 0},
+    {25, 10, 9, 0, 0},
+    {0, 0, 0, 4, 5},
+    {49, 0, 0, 4, 4}
+};
 
 static int sam_ring_full(void)
 {
-    if ((int)(sam_wr - sam_rd) >= SAM_LOOKAHEAD)
-        return 1;
-    return sam_ring_space() < 16;   /* never with the lookahead above: belt and braces */
+    return (int)(sam_wr - sam_rd) >= SAM_LOOKAHEAD;
 }
 
 static void Output8BitAry(int index, unsigned char ary[5])
 {
     int k;
     uint32_t base;
-    sam_bufpos += timetable[oldtimetableindex][index];
+    sam_base += timetable_q[oldtimetableindex][index];
+    sam_rem += timetable_r[oldtimetableindex][index];
+    if (sam_rem >= 50) {
+        sam_rem -= 50;
+        sam_base++;
+    }
     oldtimetableindex = index;
-    base = sam_bufpos / 50;
+    base = sam_base;
     for(k=0; k<5; k++)
         sam_ring[(base + k) & (SAM_RING - 1)] = ary[k];
     if (base + 5 > sam_wr) sam_wr = base + 5;
@@ -607,7 +625,6 @@ static unsigned char trans(unsigned char a, unsigned char b);
 static void AddInflection(unsigned char mem48, unsigned char phase1);
 static void render_setup(void);
 static int render_pump(void);
-static int sam_ring_space(void);
 static int sam_prepare_chunk(void);
 static int sam_chunk_done;
 static unsigned char sam_phpos;
@@ -637,16 +654,12 @@ static void sam_ring_reset(void)
     sam_rd = 0;
     sam_wr = 3;           /* the reference leaves bytes 0..2 uninitialised */
     sam_valid = 3;
-    sam_bufpos = 0;
+    sam_base = 0;
+    sam_rem = 0;
     oldtimetableindex = 0;
     rs_resume = rs_after = rs_phase = 0;
     for (i = 0; i < 3; i++)
         sam_ring[i] = 128;    /* silence instead of malloc garbage: no click */
-}
-
-static int sam_ring_space(void)
-{
-    return (int)(SAM_RING - (sam_wr - sam_rd));
 }
 
 const char *sam_voice_phonemes(void) { return (const char *)input; }
@@ -805,7 +818,7 @@ int sam_voice_next(void)
             continue;
         }
         sam_running = 0;
-        sam_valid = sam_bufpos / 50;   /* release the overlapping lookahead */
+        sam_valid = sam_base;   /* release the overlapping lookahead */
     }
 }
 
@@ -1146,5 +1159,5 @@ def slice_setup(text):
 
 rend = slice_setup(rend)
 
-open("sam/sam_port.c", "w").write(HEAD + core + "\n" + rend + API)
+open("sam/sam_port.c", "w", newline="\n").write(HEAD + core + "\n" + rend + API)
 print("wrote sam/sam_port.c")

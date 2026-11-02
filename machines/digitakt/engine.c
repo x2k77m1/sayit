@@ -475,15 +475,16 @@ void sayit_render(int32_t *blocks)
          * and a refill never share a block. */
         sam_voice_setup_tr(t);
         sayit_live_controls(t, p, s);
-        for (i = 0; i < 32; i++) {
-            int32_t q15 = s->active ? sayit_frame(s) : 0;
-            /* SAM's 8-bit stream arrives as Q15 and peaks near full scale;
-             * trim it to about -4 dBFS, as the Digitone machine does, so a
-             * track's own level and envelope sit where a sample's do. */
-            q15 = (q15 * 5) >> 3;
-            if (q15 > 32767) q15 = 32767;
-            if (q15 < -32768) q15 = -32768;
-            blocks[32 * t + i] = q15 << 16;      /* Q15 -> Q31 */
+        /* SAM's 8-bit stream arrives as Q15 and peaks near full scale;
+         * trim it to about -4 dBFS, as the Digitone machine does, so a
+         * track's own level and envelope sit where a sample's do. */
+        if (!s->active) {
+            for (i = 0; i < 32; i++)
+                blocks[32 * t + i] = 0;
+        } else {
+            int32_t n = sayit_render_block(s, blocks + 32 * t, 16);
+            for (i = n; i < 32; i++)
+                blocks[32 * t + i] = 0;
         }
     }
     sayit_prev_start = started;

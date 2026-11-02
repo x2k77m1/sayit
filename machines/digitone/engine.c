@@ -131,21 +131,19 @@ static void put_signed(int32_t v, char *buf)
 /* PIT and SPD are offsets, so their displays show the offset the player set
  * (PIT in semitones, SPD around SAM's own speed). THRT and MOUT show SAM's
  * own 0..255 formant value. */
-static void resolved_text(int32_t k, int32_t value, char *buf)
+static void value_text(int32_t k, int32_t value, char *buf)
 {
-    struct sam_settings st;
     int32_t v = value >> 8;
 
-    sayit_resolve(k == K_SPD ? v : sayit_ui_knob(K_SPD) >> 8,
-                  k == K_PIT ? sayit_map_pitch(v)
-                             : sayit_map_pitch(sayit_ui_knob(K_PIT) >> 8),
-                  k == K_THRT ? v : sayit_ui_knob(K_THRT) >> 8,
-                  k == K_MOUT ? v : sayit_ui_knob(K_MOUT) >> 8, &st);
     switch (k) {
     case K_SPD:   put_signed(v - 64, buf); break;
     case K_PIT:   put_signed(sayit_map_pitch(v), buf); break;
-    case K_THRT:  put_int(buf, st.throat); break;
-    default:      put_int(buf, st.mouth);  break;
+    case K_THRT:  put_int(buf, sayit_clamp32(
+        SAYIT_SAM_THROAT + (sayit_clamp32(v, 0, 127) - 64) * 2, 0, 255));
+        break;
+    default:      put_int(buf, sayit_clamp32(
+        SAYIT_SAM_MOUTH + (sayit_clamp32(v, 0, 127) - 64) * 2, 0, 255));
+        break;
     }
 }
 
@@ -160,17 +158,17 @@ int32_t sayit_fmt_knob(int32_t k, int32_t value, char *buf)
     case K_SPD:
     case K_PIT:
     case K_THRT:
-    case K_MOUT:  resolved_text(k, value, buf); return 0;
+    case K_MOUT:  value_text(k, value, buf); return 0;
     default:      num_text(value, buf);      return 0;
     }
 }
 
 /* struct dnm_knob's formatter is handed the value but not the knob, so each
  * resolved control gets a thunk that names itself. */
-static void spd_text(int32_t value, char *buf)  { resolved_text(K_SPD, value, buf); }
-static void pit_text(int32_t value, char *buf)  { resolved_text(K_PIT, value, buf); }
-static void thrt_text(int32_t value, char *buf) { resolved_text(K_THRT, value, buf); }
-static void mout_text(int32_t value, char *buf) { resolved_text(K_MOUT, value, buf); }
+static void spd_text(int32_t value, char *buf)  { value_text(K_SPD, value, buf); }
+static void pit_text(int32_t value, char *buf)  { value_text(K_PIT, value, buf); }
+static void thrt_text(int32_t value, char *buf) { value_text(K_THRT, value, buf); }
+static void mout_text(int32_t value, char *buf) { value_text(K_MOUT, value, buf); }
 
 static const struct dnm_knob sayit_knobs[DNM_KNOBS] = {
     [K_PIT]   = { "PIT",   pit_text, 0 },
@@ -298,6 +296,11 @@ void sayit_plan_tick(void)
                     sayit_map_mode(sayit_ui_knob_track(t, K_MODE)));
 }
 
+const struct sayit_plan *sayit_plan_for(int32_t track)
+{
+    return &sayit_pl[sayit_track(track)];
+}
+
 /* ---- the system LFOs ---------------------------------------------------- */
 /* A knob's value as the voice hears it: dnm_knob() (base and p-locks) plus
  * the two system LFOs, each when its DEST is this knob's slot, clamped to the
@@ -317,23 +320,39 @@ static int32_t sayit_lfo_add(int32_t v, int32_t slot, int32_t dest, int32_t mod,
     return v;
 }
 
-static int32_t sayit_knob(int32_t voice, int32_t k)
+struct sayit_lfo_state {
+    int32_t dest0, dest1, mod0, mod1;
+};
+
+static void sayit_lfo_read(int32_t voice, struct sayit_lfo_state *l)
+{
+    l->dest0 = (int32_t)FW_LFO(voice, 0)[FW_LFO_DEST];
+    l->dest1 = (int32_t)FW_LFO(voice, 1)[FW_LFO_DEST];
+    l->mod0 = (int32_t)FW_LFO(voice, 0)[FW_LFO_MOD];
+    l->mod1 = (int32_t)FW_LFO(voice, 1)[FW_LFO_MOD];
+}
+
+static int32_t sayit_knob_st(int32_t voice, int32_t k,
+                             const struct sayit_lfo_state *l)
 {
     int32_t v = dnm_knob(voice, k);
     int32_t slot = sayit_knob_slot(k);
-    int32_t d0, m0, d1, m1, mn = 0, mx = 0x7fffffff;
+    int32_t mn = 0, mx = 0x7fffffff;
     if (slot < 0)
         return v;
-    d0 = (int32_t)FW_LFO(voice, 0)[FW_LFO_DEST];
-    d1 = (int32_t)FW_LFO(voice, 1)[FW_LFO_DEST];
-    if (d0 != slot && d1 != slot)
+    if (l->dest0 != slot && l->dest1 != slot)
         return v;
     dnm_knob_range(k, &mn, &mx);
-    m0 = (int32_t)FW_LFO(voice, 0)[FW_LFO_MOD];
-    m1 = (int32_t)FW_LFO(voice, 1)[FW_LFO_MOD];
-    v = sayit_lfo_add(v, slot, d0, m0, mn, mx);
-    v = sayit_lfo_add(v, slot, d1, m1, mn, mx);
+    v = sayit_lfo_add(v, slot, l->dest0, l->mod0, mn, mx);
+    v = sayit_lfo_add(v, slot, l->dest1, l->mod1, mn, mx);
     return v;
+}
+
+static int32_t sayit_knob(int32_t voice, int32_t k)
+{
+    struct sayit_lfo_state l;
+    sayit_lfo_read(voice, &l);
+    return sayit_knob_st(voice, k, &l);
 }
 
 /* ---- knobs that move while a word speaks -------------------------------- */
@@ -350,17 +369,21 @@ static int32_t sayit_knob(int32_t voice, int32_t k)
 static void sayit_live_controls(int32_t voice, struct sayit_voice *s)
 {
     struct sam_settings st;
+    struct sayit_lfo_state lfo;
     int32_t spd, pit;
 
     if (!s->active)
         return;
     /* Resolved the same way a note start resolves them, so the two cannot
      * drift: the knobs as they are now, with the LFOs on top. */
-    spd = sayit_map_speed(sayit_knob(voice, K_SPD) >> 8);
+    sayit_lfo_read(voice, &lfo);
+    spd = sayit_map_speed(sayit_knob_st(voice, K_SPD, &lfo) >> 8);
     pit = sayit_pitch_steps_for_note(s->note, SAYIT_BASE,
-                                     sayit_knob(voice, K_PIT) >> 8);
-    sayit_resolve(spd, pit, sayit_map_voice(sayit_knob(voice, K_THRT) >> 8),
-                  sayit_map_voice(sayit_knob(voice, K_MOUT) >> 8), &st);
+                                     sayit_knob_st(voice, K_PIT, &lfo) >> 8);
+    sayit_resolve(spd, pit,
+                  sayit_map_voice(sayit_knob_st(voice, K_THRT, &lfo) >> 8),
+                  sayit_map_voice(sayit_knob_st(voice, K_MOUT, &lfo) >> 8),
+                  &st);
     if (st.speed == s->set.speed && st.period_q15 == s->set.period_q15)
         return;
     sam_voice_live_tr(s->track, &st);
@@ -513,23 +536,16 @@ static void sayit_render(int32_t voice, int32_t *block, const struct dnm_voice *
 
     sayit_live_controls(voice, s);
 
-    for (i = 0; i < 32; i++) {
-        int32_t q15 = sayit_frame(s);
-        /* SAM's 8-bit stream arrives as Q15 and peaks near full scale; the
-         * machine's FM voices sit lower, so trim it to about -4 dBFS.
-         * Q15 -> Q1.31 with the shift, clamped first. */
-        q15 = (q15 * 5) >> 3;
-        if (q15 > 32767) q15 = 32767;
-        if (q15 < -32768) q15 = -32768;
-        block[i] = q15 << 12;
-        if (!s->active) {
-            int32_t j;
-            for (j = i + 1; j < 32; j++)
-                block[j] = 0;
-            if (sayit_owner[tr] == voice)
-                sayit_owner[tr] = -1;
-            break;
-        }
+    /* SAM's 8-bit stream arrives as Q15 and peaks near full scale; the
+     * machine's FM voices sit lower, so trim it to about -4 dBFS.
+     * Q15 -> Q1.31 with the shift. */
+    {
+        int32_t n = sayit_render_block(s, block, 12);
+        int32_t j;
+        for (j = n; j < 32; j++)
+            block[j] = 0;
+        if (!s->active && sayit_owner[tr] == voice)
+            sayit_owner[tr] = -1;
     }
 }
 
